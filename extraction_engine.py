@@ -4,6 +4,12 @@ extraction_engine.py
 ====================
 High-precision PDF Information Extraction (IE) module for research proposals.
 
+Supports **two extraction paths**:
+  1. **Digital PDF** — native text via PyMuPDF (primary).
+  2. **Scanned PDF / OCR fallback** — if the digital text layer has < 100
+     characters, the engine automatically converts each page to a 300 DPI
+     image and runs Tesseract OCR.
+
 Usage
 -----
     python extraction_engine.py [path/to/proposal.pdf]
@@ -15,7 +21,18 @@ Outputs
 - ``metadata.json`` — structured JSON with all extracted fields.
 - A formatted summary printed to stdout.
 
-Dependencies: PyMuPDF (fitz)
+Dependencies
+------------
+- PyMuPDF (fitz)
+- pytesseract  (requires **Tesseract-OCR** installed on the system PATH)
+- pdf2image    (requires **Poppler** installed on the system PATH)
+- Pillow
+
+.. important::
+   SYSTEM REQUIREMENT: Tesseract-OCR and Poppler must be installed and
+   available on the system PATH for the OCR fallback to work.
+   - Tesseract: https://github.com/tesseract-ocr/tesseract
+   - Poppler:   https://github.com/oschwartz10612/poppler-windows (Windows)
 """
 
 from __future__ import annotations
@@ -27,6 +44,16 @@ import sys
 from typing import Any
 
 import fitz  # PyMuPDF
+
+# ── OCR dependencies (soft import — only needed for scanned PDFs) ────────────
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    from PIL import Image
+
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -66,14 +93,92 @@ DOMAIN_KEYWORDS: list[str] = [
 
 NOT_DETECTED = "Not Detected"
 
+#: If the digital text layer has fewer characters than this, trigger OCR.
+OCR_TEXT_THRESHOLD = 100
 
-# ── Text Extraction ─────────────────────────────────────────────────────────
 
-def extract_text(pdf_path: str) -> str:
-    """Open *pdf_path* with PyMuPDF and return the concatenated text of all pages."""
+# ── Text Cleaning ───────────────────────────────────────────────────────────
+
+def clean_text(text: str) -> str:
+    """
+    Standardise extracted text (applied to *both* digital and OCR output).
+
+    - Collapse consecutive whitespace / blank lines.
+    - Strip non-printable control characters.
+    - Trim leading/trailing whitespace.
+    """
+    # Remove non-printable chars (keep newlines, tabs, spaces)
+    text = re.sub(r"[^\S\n\t]+", " ", text)
+    # Collapse 3+ consecutive newlines into 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ── OCR Engine ──────────────────────────────────────────────────────────────
+
+def perform_ocr(pdf_path: str, dpi: int = 300) -> str:
+    """
+    Convert each page of *pdf_path* to a high-resolution image and run
+    Tesseract OCR on it.
+
+    Parameters
+    ----------
+    pdf_path : str
+        Path to the PDF file.
+    dpi : int
+        Resolution for the page-to-image conversion (default 300).
+
+    Returns
+    -------
+    str
+        Concatenated OCR text from all pages.
+
+    Raises
+    ------
+    pytesseract.TesseractNotFoundError
+        If the Tesseract-OCR executable is not on the system PATH.
+    RuntimeError
+        If the OCR libraries (pytesseract / pdf2image / Pillow) are not
+        installed.
+    """
+    if not _OCR_AVAILABLE:
+        raise RuntimeError(
+            "OCR libraries not installed. "
+            "Run:  pip install pytesseract pdf2image Pillow\n"
+            "Also ensure Tesseract-OCR and Poppler are on the system PATH."
+        )
+
+    # Convert PDF pages → PIL Image objects at the requested DPI
+    images: list[Image.Image] = convert_from_path(pdf_path, dpi=dpi)
+
+    ocr_parts: list[str] = []
+    for idx, img in enumerate(images, start=1):
+        page_text = pytesseract.image_to_string(img)
+        if page_text:
+            ocr_parts.append(page_text)
+
+    return "\n".join(ocr_parts)
+
+
+# ── Text Extraction (with OCR fallback) ─────────────────────────────────────
+
+def extract_text(pdf_path: str) -> tuple[str, bool]:
+    """
+    Extract text from *pdf_path*.
+
+    **Primary path:** PyMuPDF digital text extraction.
+    **Fallback:** If the digital text has fewer than ``OCR_TEXT_THRESHOLD``
+    characters, automatically run OCR via ``perform_ocr()``.
+
+    Returns
+    -------
+    (text, is_ocr) : tuple[str, bool]
+        The cleaned text and a flag indicating whether OCR was used.
+    """
     if not os.path.isfile(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
+    # ── 1. Try digital text extraction (PyMuPDF) ────────────────────────
     text_parts: list[str] = []
     with fitz.open(pdf_path) as doc:
         for page in doc:
@@ -81,7 +186,20 @@ def extract_text(pdf_path: str) -> str:
             if page_text:
                 text_parts.append(page_text)
 
-    return "\n".join(text_parts)
+    digital_text = "\n".join(text_parts)
+    is_ocr = False
+
+    # ── 2. Fallback to OCR if digital text is too short ─────────────────
+    if len(digital_text.strip()) < OCR_TEXT_THRESHOLD:
+        try:
+            digital_text = perform_ocr(pdf_path)
+            is_ocr = True
+        except Exception:
+            # If OCR also fails, proceed with whatever digital text we have
+            pass
+
+    # ── 3. Standardise ──────────────────────────────────────────────────
+    return clean_text(digital_text), is_ocr
 
 
 # ── Field Extractors ────────────────────────────────────────────────────────
@@ -219,11 +337,12 @@ def extract_metadata(pdf_path: str) -> dict[str, Any]:
       "principal_investigator": "...",
       "budget": "...",
       "timeline": "...",
-      "keywords": ["...", "..."]
+      "keywords": ["...", "..."],
+      "extraction_method": "Digital Text Layer" | "OCR (Scanned Document)"
     }
     ```
     """
-    text = extract_text(pdf_path)
+    text, is_ocr = extract_text(pdf_path)
 
     title = _extract_title(text)
     pi = _extract_pi(text)
@@ -238,6 +357,7 @@ def extract_metadata(pdf_path: str) -> dict[str, Any]:
         "budget": budget,
         "timeline": timeline,
         "keywords": keywords if keywords else NOT_DETECTED,
+        "extraction_method": "OCR (Scanned Document)" if is_ocr else "Digital Text Layer",
     }
 
 
@@ -262,6 +382,7 @@ def print_summary(data: dict[str, Any]) -> None:
     print("  PDF INFORMATION EXTRACTION - RESULTS")
     print("=" * width)
     print(f"  Source File  : {data['source_file']}")
+    print(f"  Extraction   : {data.get('extraction_method', 'Digital Text Layer')}")
     print(f"  Title        : {data['project_title']}")
     print(f"  PI           : {data['principal_investigator']}")
     print(f"  Budget       : {data['budget']}")

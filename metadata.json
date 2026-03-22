@@ -1,25 +1,24 @@
 {
-    "source_file": "sample_proposal.pdf",
-    "project_title": "Advanced Methane Detection and Safety Automation",
-    "principal_investigator": "Dr. Ananya Sharma",
-    "budget": "₹90,00,000",
-    "timeline": "36 months (3 years)",
+    "source_file": "advanced_proposal.pdf",
+    "project_title": "OFFICIAL USE ONLY - MINISTRY OF COAL R&D DIVISION",
+    "principal_investigator": "Not Detected",
+    "budget": "Rs. 42,00,000",
+    "timeline": "20 years",
     "keywords": [
-        "Anomaly Detection",
-        "Automation",
-        "Clean Coal",
+        "Blue Hydrogen",
+        "Carbon Capture",
         "Coal",
-        "Emissions",
+        "Coal Gasification",
         "Excavation",
-        "Hazardous",
-        "IoT",
-        "LiDAR",
-        "Methane",
+        "Fault Prediction",
+        "Mine Safety Monitoring",
         "Mining",
-        "Prototyping",
+        "Perovskite Solar",
+        "Pit Lake Management",
         "Safety",
         "Sensor",
-        "Underground Mining",
-        "Ventilation"
-    ]
+        "Ventilation",
+        "Waste to Wealth"
+    ],
+    "extraction_method": "Digital Text Layer"
 }

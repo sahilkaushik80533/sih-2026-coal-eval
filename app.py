@@ -137,8 +137,13 @@ st.markdown(
 
 # ── Helper: extract from uploaded bytes ──────────────────────────────────────
 
-def extract_from_upload(uploaded_file) -> dict[str, Any]:
-    """Save an uploaded PDF to a temp file. Run extraction_engine on it."""
+def extract_from_upload(uploaded_file) -> tuple[dict[str, Any], bool]:
+    """Save an uploaded PDF to a temp file. Run extraction_engine on it.
+
+    Returns
+    -------
+    (metadata, is_ocr) : tuple[dict, bool]
+    """
     suffix = ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
@@ -151,7 +156,8 @@ def extract_from_upload(uploaded_file) -> dict[str, Any]:
     finally:
         os.unlink(tmp_path)
 
-    return metadata
+    is_ocr = metadata.get("extraction_method", "").startswith("OCR")
+    return metadata, is_ocr
 
 
 # ── Helper: Plotly score breakdown chart ─────────────────────────────────────
@@ -294,15 +300,65 @@ if "scored_proposals" not in st.session_state:
 new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_names]
 
 if new_files:
-    with st.spinner(f"Extracting metadata from {len(new_files)} PDF(s)…"):
-        for uf in new_files:
-            metadata = extract_from_upload(uf)
-            scored = calculate_score(metadata)
-            # Preserve the raw metadata too
-            scored["keywords_all"] = metadata.get("keywords", [])
-            scored["source_file"] = metadata.get("source_file", uf.name)
-            st.session_state.scored_proposals.append(scored)
-            st.session_state.processed_names.add(uf.name)
+    for uf in new_files:
+        try:
+            with st.status(f"Processing **{uf.name}** ...", expanded=True) as status:
+                st.write("Attempting digital text extraction (PyMuPDF)...")
+                metadata, is_ocr = extract_from_upload(uf)
+
+                if is_ocr:
+                    st.info(
+                        "Digital text layer not detected. "
+                        "Initializing OCR Engine for scanned document analysis...",
+                        icon="🔍",
+                    )
+
+                st.write(f"Extraction method: **{metadata.get('extraction_method', 'Digital Text Layer')}**")
+                st.write("Calculating score...")
+
+                scored = calculate_score(metadata)
+                # Preserve raw metadata
+                scored["keywords_all"] = metadata.get("keywords", [])
+                scored["source_file"] = metadata.get("source_file", uf.name)
+                scored["extraction_method"] = metadata.get("extraction_method", "Digital Text Layer")
+
+                # Append OCR source info to justification
+                if is_ocr:
+                    existing = scored.get("justification", "")
+                    ocr_note = "Source: Scanned Image (OCR processed)"
+                    scored["justification"] = f"{ocr_note}. {existing}" if existing else ocr_note
+
+                st.session_state.scored_proposals.append(scored)
+                st.session_state.processed_names.add(uf.name)
+                status.update(label=f"**{uf.name}** — done!", state="complete")
+
+        except RuntimeError as exc:
+            # OCR libraries not installed
+            st.error(
+                f"**OCR Error for {uf.name}:** {exc}\n\n"
+                "**How to fix:**\n"
+                "1. Install Python packages: `pip install pytesseract pdf2image Pillow`\n"
+                "2. Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) "
+                "and add it to your system PATH.\n"
+                "3. Install [Poppler](https://github.com/oschwartz10612/poppler-windows) "
+                "(Windows) and add it to your system PATH.",
+                icon="⚠️",
+            )
+        except Exception as exc:
+            # Catch pytesseract.TesseractNotFoundError and other unexpected errors
+            err_name = type(exc).__name__
+            if "TesseractNotFound" in err_name:
+                st.error(
+                    f"**Tesseract OCR not found** while processing **{uf.name}**.\n\n"
+                    "The scanned PDF requires OCR, but Tesseract is not installed.\n\n"
+                    "**How to fix:**\n"
+                    "1. Download and install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract).\n"
+                    "2. Ensure the `tesseract` executable is on your system PATH.\n"
+                    "3. Restart the Streamlit app.",
+                    icon="⚠️",
+                )
+            else:
+                st.error(f"Failed to process **{uf.name}**: {exc}", icon="❌")
 
 # Handle file removals (user cleared some files)
 current_names = {f.name for f in uploaded_files}
