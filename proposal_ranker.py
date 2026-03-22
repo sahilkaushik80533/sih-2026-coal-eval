@@ -51,6 +51,19 @@ PRIORITY_KEYWORDS: list[str] = [
     "Emissions",
 ]
 
+#: 2026 Strategic Goal keywords — presence triggers special justification note.
+STRATEGIC_KEYWORDS_2026: list[str] = [
+    "Coal Gasification",
+    "Blue Hydrogen",
+    "Perovskite Solar",
+    "Fault Prediction",
+    "Fluoride Removal",
+    "Mine Safety Monitoring",
+    "Waste to Wealth",
+    "Carbon Capture",
+    "Pit Lake Management",
+]
+
 BUDGET_THRESHOLD_LOW: float = 50_00_000       # ₹50 Lakh — ideal ceiling
 BUDGET_THRESHOLD_HIGH: float = 1_00_00_000    # ₹1 Crore — upper comfort zone
 
@@ -130,7 +143,7 @@ def academic_rank_bonus(pi_name: str) -> tuple[int, str]:
 
 def calculate_score(metadata: dict[str, Any]) -> dict[str, Any]:
     """
-    Score a single proposal and return a detailed breakdown.
+    Score a single proposal and return a detailed breakdown with justification.
 
     Returns
     -------
@@ -138,21 +151,35 @@ def calculate_score(metadata: dict[str, Any]) -> dict[str, Any]:
         title, pi, budget_raw, timeline_raw,
         budget_value, timeline_months,
         budget_score, keyword_score, timeline_score, pi_bonus, pi_rank,
-        matched_keywords, total_score
+        matched_keywords, total_score, justification
     """
+    justification_parts: list[str] = []
+
     # ── Budget (max 30) ──────────────────────────────────────────────────
     budget_value = parse_budget(metadata.get("budget", ""))
 
     if budget_value <= 0:
         budget_score = 15.0  # unknown — neutral
+        justification_parts.append("Budget not detected; neutral 15/30 assigned.")
     elif budget_value <= BUDGET_THRESHOLD_LOW:
         budget_score = 30.0
+        justification_parts.append(
+            f"Budget ₹{budget_value:,.0f} is within the ₹50L cap — full 30/30."
+        )
     elif budget_value <= BUDGET_THRESHOLD_HIGH:
-        # Linear interpolation: 30 → 15 between 50 L and 1 Cr
         ratio = (budget_value - BUDGET_THRESHOLD_LOW) / (BUDGET_THRESHOLD_HIGH - BUDGET_THRESHOLD_LOW)
         budget_score = 30.0 - ratio * 15.0
+        lost = round(30.0 - budget_score, 1)
+        justification_parts.append(
+            f"Points deducted: Budget ₹{budget_value:,.0f} exceeds ₹50L cap "
+            f"(−{lost} pts, scored {round(budget_score, 1)}/30)."
+        )
     else:
         budget_score = 5.0
+        justification_parts.append(
+            f"Points deducted: Budget ₹{budget_value:,.0f} exceeds ₹1Cr ceiling "
+            f"(scored 5/30)."
+        )
 
     # ── Keywords (max 50) ────────────────────────────────────────────────
     proposal_keywords: list[str] = metadata.get("keywords", [])
@@ -168,25 +195,60 @@ def calculate_score(metadata: dict[str, Any]) -> dict[str, Any]:
 
     keyword_score = min(len(matched_keywords) * 5, 50)
 
+    if matched_keywords:
+        justification_parts.append(
+            f"Matched {len(matched_keywords)} priority keyword(s) → {keyword_score}/50."
+        )
+    else:
+        justification_parts.append("No priority keywords matched — 0/50.")
+
+    # ── 2026 Strategic Alignment ─────────────────────────────────────────
+    matched_2026: list[str] = []
+    for sk in STRATEGIC_KEYWORDS_2026:
+        for kw in proposal_keywords:
+            if sk.lower() == kw.lower():
+                matched_2026.append(sk)
+                break
+
+    if matched_2026:
+        justification_parts.append(
+            f"Strong alignment with 2026 Strategic Goals: {', '.join(matched_2026)}."
+        )
+
     # ── Timeline (max 20) ────────────────────────────────────────────────
     timeline_months = parse_timeline(metadata.get("timeline", ""))
 
     if timeline_months <= 0:
         timeline_score = 10.0  # unknown — neutral
+        justification_parts.append("Timeline not detected; neutral 10/20 assigned.")
     elif timeline_months <= TIMELINE_IDEAL_MONTHS:
         timeline_score = 20.0
+        justification_parts.append(
+            f"Timeline {timeline_months} months ≤ 24-month ideal — full 20/20."
+        )
     elif timeline_months <= TIMELINE_PENALTY_MONTHS:
-        # Linear interpolation: 20 → 10 between 24 and 36 months
         ratio = (timeline_months - TIMELINE_IDEAL_MONTHS) / (TIMELINE_PENALTY_MONTHS - TIMELINE_IDEAL_MONTHS)
         timeline_score = 20.0 - ratio * 10.0
+        lost = round(20.0 - timeline_score, 1)
+        justification_parts.append(
+            f"Points deducted: Timeline {timeline_months} months exceeds 24-month ideal "
+            f"(−{lost} pts, scored {round(timeline_score, 1)}/20)."
+        )
     else:
         timeline_score = 5.0
+        justification_parts.append(
+            f"Points deducted: Timeline {timeline_months} months exceeds 36-month limit "
+            f"(scored 5/20)."
+        )
 
     # ── PI Bonus ─────────────────────────────────────────────────────────
     pi_name = metadata.get("principal_investigator", "")
     pi_bonus, pi_rank = academic_rank_bonus(pi_name)
+    if pi_bonus:
+        justification_parts.append(f"PI rank bonus: +{pi_bonus} ({pi_rank}).")
 
     total = budget_score + keyword_score + timeline_score + pi_bonus
+    justification = " ".join(justification_parts)
 
     return {
         "title": metadata.get("project_title", "Untitled"),
@@ -202,6 +264,7 @@ def calculate_score(metadata: dict[str, Any]) -> dict[str, Any]:
         "pi_rank": pi_rank,
         "matched_keywords": matched_keywords,
         "total_score": round(total, 1),
+        "justification": justification,
     }
 
 

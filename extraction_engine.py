@@ -52,6 +52,16 @@ DOMAIN_KEYWORDS: list[str] = [
     "Machine Learning",
     "Gas Detection",
     "Hazardous",
+    # ── 2026 Ministry of Coal Strategic Goals ─────────────────────────
+    "Coal Gasification",
+    "Blue Hydrogen",
+    "Perovskite Solar",
+    "Fault Prediction",
+    "Fluoride Removal",
+    "Mine Safety Monitoring",
+    "Waste to Wealth",
+    "Carbon Capture",
+    "Pit Lake Management",
 ]
 
 NOT_DETECTED = "Not Detected"

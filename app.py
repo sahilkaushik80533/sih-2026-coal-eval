@@ -23,7 +23,12 @@ import streamlit as st
 
 # ── Local module imports ─────────────────────────────────────────────────────
 from extraction_engine import extract_metadata
-from proposal_ranker import calculate_score, parse_budget, PRIORITY_KEYWORDS
+from proposal_ranker import (
+    calculate_score,
+    parse_budget,
+    PRIORITY_KEYWORDS,
+    STRATEGIC_KEYWORDS_2026,
+)
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -329,6 +334,15 @@ tab_leader, tab_compare = st.tabs(["📊  Leaderboard", "⚖️  Compare Mode"])
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_leader:
 
+    # ── Winner callout ───────────────────────────────────────────────────
+    best_proposal = proposals_ranked[0]
+    st.success(
+        f"🏆 **#1 Ranked Proposal:** {best_proposal['title']}  "
+        f"— Score: **{best_proposal['total_score']} pts**",
+        icon="🏆",
+    )
+    st.markdown("")
+
     # ── Metric cards ─────────────────────────────────────────────────────
     best = proposals_ranked[0]
     budgets = [
@@ -382,6 +396,7 @@ with tab_leader:
                 "Timeline Score (/20)": s["timeline_score"],
                 "PI Bonus": s["pi_bonus"],
                 "Total Score": s["total_score"],
+                "Justification": s.get("justification", ""),
             }
             for idx, s in enumerate(proposals_ranked, 1)
         ]
@@ -394,7 +409,17 @@ with tab_leader:
         column_config={
             "Rank": st.column_config.NumberColumn(width="small"),
             "Total Score": st.column_config.NumberColumn(format="%.1f"),
+            "Justification": st.column_config.TextColumn(width="large"),
         },
+    )
+
+    # ── CSV Export ────────────────────────────────────────────────────────
+    csv_data = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Download Leaderboard as CSV",
+        data=csv_data,
+        file_name="proposal_leaderboard.csv",
+        mime="text/csv",
     )
 
     # ── Detailed view ────────────────────────────────────────────────────
