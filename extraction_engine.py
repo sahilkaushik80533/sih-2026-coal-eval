@@ -94,7 +94,27 @@ DOMAIN_KEYWORDS: list[str] = [
 NOT_DETECTED = "Not Detected"
 
 #: If the digital text layer has fewer characters than this, trigger OCR.
-OCR_TEXT_THRESHOLD = 100
+#: Raised from 100 → 1000 to catch 'phantom text' (PDFs with only headers
+#: or metadata in their text layer that would otherwise bypass OCR).
+OCR_TEXT_THRESHOLD = 1000
+
+#: Validation keywords that a genuine research-proposal PDF should contain.
+#: Used as a secondary quality gate: even if the text is long enough, it must
+#: contain at least ``VALIDATION_KEYWORD_MIN`` of these terms to be trusted.
+VALIDATION_KEYWORDS: list[str] = [
+    "budget",
+    "proposal",
+    "ministry",
+    "project",
+    "technical",
+]
+VALIDATION_KEYWORD_MIN = 2  # minimum matches required
+
+
+def _count_validation_matches(text: str) -> int:
+    """Count how many ``VALIDATION_KEYWORDS`` appear in *text* (case-insensitive)."""
+    text_lower = text.lower()
+    return sum(1 for kw in VALIDATION_KEYWORDS if kw in text_lower)
 
 
 # ── Text Cleaning ───────────────────────────────────────────────────────────
@@ -167,8 +187,12 @@ def extract_text(pdf_path: str) -> tuple[str, bool]:
     Extract text from *pdf_path*.
 
     **Primary path:** PyMuPDF digital text extraction.
-    **Fallback:** If the digital text has fewer than ``OCR_TEXT_THRESHOLD``
-    characters, automatically run OCR via ``perform_ocr()``.
+    **Fallback:** OCR is triggered when *either* condition is true:
+
+    1. The digital text has fewer than ``OCR_TEXT_THRESHOLD`` characters
+       (likely a scanned document or near-empty text layer).
+    2. Fewer than ``VALIDATION_KEYWORD_MIN`` validation keywords are found
+       (the text layer is probably phantom/header-only metadata).
 
     Returns
     -------
@@ -177,6 +201,8 @@ def extract_text(pdf_path: str) -> tuple[str, bool]:
     """
     if not os.path.isfile(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    basename = os.path.basename(pdf_path)
 
     # ── 1. Try digital text extraction (PyMuPDF) ────────────────────────
     text_parts: list[str] = []
@@ -189,14 +215,39 @@ def extract_text(pdf_path: str) -> tuple[str, bool]:
     digital_text = "\n".join(text_parts)
     is_ocr = False
 
-    # ── 2. Fallback to OCR if digital text is too short ─────────────────
-    if len(digital_text.strip()) < OCR_TEXT_THRESHOLD:
+    # ── 2. Decide: trust the digital text or fall back to OCR? ──────────
+    text_len = len(digital_text.strip())
+    kw_matches = _count_validation_matches(digital_text)
+
+    needs_ocr = False
+    ocr_reason = ""
+
+    if text_len < OCR_TEXT_THRESHOLD:
+        needs_ocr = True
+        ocr_reason = (
+            f"Digital text too short ({text_len} chars < {OCR_TEXT_THRESHOLD} threshold)"
+        )
+    elif kw_matches < VALIDATION_KEYWORD_MIN:
+        needs_ocr = True
+        ocr_reason = (
+            f"Low keyword density detected ({kw_matches}/{VALIDATION_KEYWORD_MIN} "
+            f"validation keywords found), forcing OCR"
+        )
+
+    if needs_ocr:
+        print(f"[OCR] {basename}: {ocr_reason}. Switching to OCR path...")
         try:
             digital_text = perform_ocr(pdf_path)
             is_ocr = True
-        except Exception:
+            print(f"[OCR] {basename}: OCR extraction completed successfully.")
+        except Exception as exc:
             # If OCR also fails, proceed with whatever digital text we have
-            pass
+            print(f"[OCR] {basename}: OCR failed ({exc}), using available digital text.")
+    else:
+        print(
+            f"[DIGITAL] {basename}: Digital text layer accepted "
+            f"({text_len} chars, {kw_matches} validation keywords matched)."
+        )
 
     # ── 3. Standardise ──────────────────────────────────────────────────
     return clean_text(digital_text), is_ocr
