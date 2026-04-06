@@ -17,6 +17,15 @@ To enable data persistence, create a ``.streamlit/secrets.toml`` file with
 your GCP service-account credentials and spreadsheet URL.  See the template
 shipped alongside this project for details.  The app runs in **offline mode**
 when credentials are not configured.
+
+Data Caching Strategy
+---------------------
+- ``fetch_sheet_data()`` is decorated with ``@st.cache_data(ttl=30)`` so
+  reads from Google Sheets are cached for 30 seconds, avoiding redundant
+  API calls on every Streamlit rerun.
+- When new data is submitted (via the Entry form or the Submit button),
+  ``st.cache_data.clear()`` is called explicitly to force a fresh read on
+  the next render, keeping the View tab in real-time sync.
 """
 
 from __future__ import annotations
@@ -45,6 +54,29 @@ try:
     _GSHEETS_LIB_AVAILABLE = True
 except ImportError:
     _GSHEETS_LIB_AVAILABLE = False
+
+# ── Constants ────────────────────────────────────────────────────────────────
+SERVICE_ACCOUNT_EMAIL = "sih-robot@sih-coal-eval.iam.gserviceaccount.com"
+
+#: Columns for the coal-evaluation records worksheet.
+EVAL_COLUMNS: list[str] = [
+    "Timestamp",
+    "Coal Grade",
+    "Ash %",
+    "Moisture %",
+    "Volatile Matter %",
+    "Fixed Carbon %",
+    "GCV (kcal/kg)",
+    "Location / Mine",
+    "Evaluator",
+    "Remarks",
+]
+
+#: Columns for the proposal-submission worksheet.
+PROPOSAL_COLUMNS: list[str] = [
+    "Timestamp", "Title", "PI", "Budget",
+    "Timeline", "Total Score", "Justification",
+]
 
 
 # ── Page Config ──────────────────────────────────────────────────────────────
@@ -113,7 +145,128 @@ st.markdown(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
+#  GOOGLE SHEETS — CONNECTION & DATA OPS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _get_gsheets_connection():
+    """
+    Establish a Google Sheets connection.
+
+    Returns
+    -------
+    (conn, error_msg) : tuple
+        conn is a GSheetsConnection or None; error_msg explains the failure.
+    """
+    if not _GSHEETS_LIB_AVAILABLE:
+        return None, (
+            "`st-gsheets-connection` is not installed.\n\n"
+            "Run: `pip install st-gsheets-connection`"
+        )
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        return conn, None
+    except FileNotFoundError:
+        return None, (
+            "**Spreadsheet not found.** The URL in `secrets.toml` may be "
+            "incorrect or the sheet has been deleted.\n\n"
+            "Please verify `[connections.gsheets] → spreadsheet` in "
+            "`.streamlit/secrets.toml`."
+        )
+    except PermissionError:
+        return None, (
+            "**Permission denied.** The service account does not have "
+            "editor access to the Google Sheet.\n\n"
+            "**Fix:** Open your Google Sheet → Share → add "
+            f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**."
+        )
+    except Exception as exc:
+        err_str = str(exc).lower()
+        if "permission" in err_str or "403" in err_str:
+            return None, (
+                f"**Permission denied (403).** The service account "
+                f"`{SERVICE_ACCOUNT_EMAIL}` does not have access.\n\n"
+                "**Fix:** Open your Google Sheet → Share → add "
+                f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**."
+            )
+        if "not found" in err_str or "404" in err_str:
+            return None, (
+                "**Sheet not found (404).** Check the spreadsheet URL in "
+                "`.streamlit/secrets.toml`."
+            )
+        return None, f"Connection failed: {exc}"
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_sheet_data(_conn, worksheet: str = "Sheet1") -> pd.DataFrame | None:
+    """
+    Read all rows from *worksheet*.  Cached for 30 s to reduce API calls.
+
+    Pass the connection object as ``_conn`` (underscore prefix tells
+    Streamlit not to hash it).
+    """
+    try:
+        data = _conn.read(worksheet=worksheet)
+        if data is not None and not data.empty:
+            # Drop fully‐NaN rows that gsheets sometimes returns
+            data = data.dropna(how="all")
+        return data
+    except Exception:
+        return None
+
+
+def append_row(conn, worksheet: str, columns: list[str],
+               row_dict: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Append *row_dict* as a new row to *worksheet*.
+
+    Returns (success, message).
+    """
+    try:
+        existing = conn.read(worksheet=worksheet)
+        if existing is None or existing.empty:
+            existing = pd.DataFrame(columns=columns)
+        else:
+            existing = existing.dropna(how="all")
+
+        new_row = pd.DataFrame([row_dict])
+        updated = pd.concat([existing, new_row], ignore_index=True)
+        conn.update(worksheet=worksheet, data=updated)
+
+        # Bust the cache so the View tab refreshes immediately
+        st.cache_data.clear()
+        return True, "Row appended successfully."
+    except PermissionError:
+        return False, (
+            f"**Permission denied.** Share the sheet with "
+            f"`{SERVICE_ACCOUNT_EMAIL}` as Editor."
+        )
+    except Exception as exc:
+        err = str(exc).lower()
+        if "permission" in err or "403" in err:
+            return False, (
+                f"**Permission denied (403).** Share the sheet with "
+                f"`{SERVICE_ACCOUNT_EMAIL}` as Editor."
+            )
+        return False, f"Write failed: {exc}"
+
+
+# Legacy wrapper used by the Dashboard tab's "Submit to Ministry" button.
+def submit_to_sheets(conn, scored: dict[str, Any]) -> bool:
+    ok, _ = append_row(conn, "Sheet1", PROPOSAL_COLUMNS, {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Title": scored["title"],
+        "PI": scored["pi"],
+        "Budget": scored["budget_raw"],
+        "Timeline": scored["timeline_raw"],
+        "Total Score": scored["total_score"],
+        "Justification": scored.get("justification", ""),
+    })
+    return ok
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -131,9 +284,13 @@ def extract_from_upload(uploaded_file) -> tuple[dict[str, Any], bool]:
     return metadata, is_ocr
 
 
-# ── Plotly: horizontal bar chart (score breakdown) ───────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PLOTLY CHARTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 
 def score_breakdown_chart(scored: dict[str, Any], height: int = 300) -> go.Figure:
+    """Horizontal bar chart showing the 4 score components."""
     categories = ["Budget (/30)", "Keywords (/50)", "Timeline (/20)", "PI Bonus"]
     values = [scored["budget_score"], scored["keyword_score"],
               scored["timeline_score"], scored["pi_bonus"]]
@@ -163,26 +320,19 @@ def score_breakdown_chart(scored: dict[str, Any], height: int = 300) -> go.Figur
     return fig
 
 
-# ── Plotly: radar / spider chart (5-axis analytics) ──────────────────────────
-
 def radar_chart(scored: dict[str, Any], height: int = 380) -> go.Figure:
     """
     Five-axis radar chart normalised to 0–100 %.
 
     Axes:
-      1. Budget Efficiency      →  budget_score / 30 * 100
-      2. Strategic Alignment    →  keyword_score / 50 * 100
-      3. Timeline Realism       →  timeline_score / 20 * 100
-      4. PI Experience          →  pi_bonus / 3 * 100  (cap 100)
-      5. Overall Compliance     →  total_score / 103 * 100
+      1. Budget Efficiency    →  budget_score / 30 × 100
+      2. Strategic Alignment  →  keyword_score / 50 × 100
+      3. Timeline Realism     →  timeline_score / 20 × 100
+      4. PI Experience        →  pi_bonus / 3 × 100  (cap 100)
+      5. Overall Compliance   →  total_score / 103 × 100
     """
-    axes = [
-        "Budget Efficiency",
-        "Strategic Alignment",
-        "Timeline Realism",
-        "PI Experience",
-        "Overall Compliance",
-    ]
+    axes = ["Budget Efficiency", "Strategic Alignment", "Timeline Realism",
+            "PI Experience", "Overall Compliance"]
     values = [
         round(scored["budget_score"] / 30 * 100, 1),
         round(scored["keyword_score"] / 50 * 100, 1),
@@ -190,22 +340,17 @@ def radar_chart(scored: dict[str, Any], height: int = 380) -> go.Figure:
         min(round(scored["pi_bonus"] / 3 * 100, 1), 100),
         round(scored["total_score"] / 103 * 100, 1),
     ]
-    # Close the polygon
     axes_closed = axes + [axes[0]]
     values_closed = values + [values[0]]
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatterpolar(
-            r=values_closed,
-            theta=axes_closed,
-            fill="toself",
-            fillcolor="rgba(30,136,229,0.25)",
-            line=dict(color="#1e88e5", width=2),
-            marker=dict(size=6, color="#42a5f5"),
-            name=scored["title"][:30],
-        )
-    )
+    fig.add_trace(go.Scatterpolar(
+        r=values_closed, theta=axes_closed,
+        fill="toself", fillcolor="rgba(30,136,229,0.25)",
+        line=dict(color="#1e88e5", width=2),
+        marker=dict(size=6, color="#42a5f5"),
+        name=scored["title"][:30],
+    ))
     fig.update_layout(
         polar=dict(
             radialaxis=dict(visible=True, range=[0, 100],
@@ -242,49 +387,8 @@ def render_proposal_card(scored: dict[str, Any]) -> None:
         st.markdown("##### Score Breakdown")
         st.plotly_chart(score_breakdown_chart(scored), use_container_width=True)
 
-    # ── Detailed Scoring Analytics (radar) ───────────────────────────────
     with st.expander("📊 Detailed Scoring Analytics"):
         st.plotly_chart(radar_chart(scored), use_container_width=True)
-
-
-# ── Google Sheets helpers ────────────────────────────────────────────────────
-
-def _get_gsheets_connection():
-    """Try to establish a Google Sheets connection.  Returns (conn, error_msg)."""
-    if not _GSHEETS_LIB_AVAILABLE:
-        return None, "st-gsheets-connection library not installed."
-    try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        return conn, None
-    except Exception as exc:
-        return None, str(exc)
-
-
-def submit_to_sheets(conn, scored: dict[str, Any]) -> bool:
-    """Append a single proposal row to the connected Google Sheet."""
-    try:
-        existing = conn.read(worksheet="Sheet1", usecols=list(range(7)))
-        if existing is None or existing.empty:
-            existing = pd.DataFrame(columns=[
-                "Timestamp", "Title", "PI", "Budget",
-                "Timeline", "Total Score", "Justification",
-            ])
-
-        new_row = pd.DataFrame([{
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Title": scored["title"],
-            "PI": scored["pi"],
-            "Budget": scored["budget_raw"],
-            "Timeline": scored["timeline_raw"],
-            "Total Score": scored["total_score"],
-            "Justification": scored.get("justification", ""),
-        }])
-
-        updated = pd.concat([existing, new_row], ignore_index=True)
-        conn.update(worksheet="Sheet1", data=updated)
-        return True
-    except Exception:
-        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -292,39 +396,43 @@ def submit_to_sheets(conn, scored: dict[str, Any]) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 gsheets_conn, gsheets_error = _get_gsheets_connection()
+_gsheets_online = gsheets_conn is not None and gsheets_error is None
 
 with st.sidebar:
     st.markdown("## ⚒️ Ministry of Coal")
     st.markdown("### R&D Proposal Evaluator")
     st.markdown("---")
 
-    uploaded_files = st.file_uploader(
-        "Upload R&D Proposal PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Upload two or more PDF proposals to compare them.",
+    # ── Navigation ───────────────────────────────────────────────────────
+    nav = st.radio(
+        "Navigation",
+        ["🏠 Proposal Evaluator", "📋 View Records", "➕ New Entry"],
+        label_visibility="collapsed",
     )
 
-    # ── Database Settings ────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 🗄️ Database Settings")
 
-    if gsheets_conn and not gsheets_error:
+    # ── Database Settings ────────────────────────────────────────────────
+    st.markdown("### 🗄️ Database Settings")
+    if _gsheets_online:
         st.success("Google Sheets: **Connected**", icon="🟢")
-        # Try to show sheet URL from secrets
         sheet_url = st.secrets.get("connections", {}).get("gsheets", {}).get("spreadsheet", "")
         if sheet_url:
-            st.caption(f"Sheet: {sheet_url[:50]}…")
+            st.caption(f"📄 {sheet_url[:55]}…")
+        st.caption(f"👤 `{SERVICE_ACCOUNT_EMAIL}`")
     else:
         st.warning("Google Sheets: **Offline Mode**", icon="🔴")
-        st.caption("Configure `.streamlit/secrets.toml` to enable persistence.")
+        if gsheets_error:
+            st.caption(gsheets_error[:120])
+        else:
+            st.caption("Configure `.streamlit/secrets.toml` to enable persistence.")
 
     st.markdown("---")
     st.caption("SIH 2026 · Built with Streamlit")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN AREA
+#  MAIN AREA — HEADER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.markdown(
@@ -337,7 +445,165 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Process uploads ──────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE: VIEW RECORDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if nav == "📋 View Records":
+    st.markdown("### 📋 Coal Evaluation Records — Google Sheets")
+
+    if not _gsheets_online:
+        st.error(
+            "**Google Sheets is offline.** Cannot load records.\n\n"
+            + (gsheets_error or "Configure `.streamlit/secrets.toml`."),
+            icon="🔴",
+        )
+        st.stop()
+
+    with st.spinner("Fetching records from Google Sheets…"):
+        sheet_df = fetch_sheet_data(gsheets_conn)
+
+    if sheet_df is None or sheet_df.empty:
+        st.info("The Google Sheet is empty — no records to display yet.", icon="📭")
+    else:
+        # ── Summary metrics ──────────────────────────────────────────────
+        vm1, vm2, vm3 = st.columns(3)
+        with vm1:
+            st.metric("📋 Total Records", len(sheet_df))
+        with vm2:
+            # Show unique coal grades if the column exists
+            if "Coal Grade" in sheet_df.columns:
+                st.metric("⛏️ Unique Grades", sheet_df["Coal Grade"].nunique())
+            elif "Title" in sheet_df.columns:
+                st.metric("📑 Unique Titles", sheet_df["Title"].nunique())
+            else:
+                st.metric("📊 Columns", len(sheet_df.columns))
+        with vm3:
+            if "Timestamp" in sheet_df.columns:
+                st.metric("🕐 Latest Entry", str(sheet_df["Timestamp"].iloc[-1])[:16])
+            else:
+                st.metric("📊 Rows", len(sheet_df))
+
+        st.markdown("")
+
+        # ── Search / filter ──────────────────────────────────────────────
+        search_term = st.text_input(
+            "🔍 Search records",
+            placeholder="Type to filter across all columns…",
+            key="view_search",
+        )
+        display_df = sheet_df
+        if search_term:
+            mask = sheet_df.astype(str).apply(
+                lambda col: col.str.contains(search_term, case=False, na=False)
+            ).any(axis=1)
+            display_df = sheet_df[mask]
+            st.caption(f"Showing {len(display_df)} of {len(sheet_df)} records.")
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # ── CSV download ─────────────────────────────────────────────────
+        st.download_button(
+            "📥 Export as CSV",
+            data=display_df.to_csv(index=False).encode("utf-8"),
+            file_name="coal_eval_records.csv",
+            mime="text/csv",
+        )
+
+    st.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE: NEW ENTRY (Coal Evaluation Form)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if nav == "➕ New Entry":
+    st.markdown("### ➕ New Coal Evaluation Entry")
+
+    if not _gsheets_online:
+        st.error(
+            "**Google Sheets is offline.** Cannot submit entries.\n\n"
+            + (gsheets_error or "Configure `.streamlit/secrets.toml`."),
+            icon="🔴",
+        )
+        st.stop()
+
+    st.caption(
+        "Fill in the coal sample evaluation form below. All data is appended "
+        "to the connected Google Sheet in real-time."
+    )
+
+    with st.form("coal_entry_form", clear_on_submit=True):
+        st.markdown("##### Sample Details")
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            coal_grade = st.selectbox(
+                "Coal Grade",
+                ["A", "B", "C", "D", "E", "F", "G",
+                 "Semi-Coking", "Coking", "Washery"],
+                help="Indian coal grade classification.",
+            )
+            ash = st.number_input("Ash %", 0.0, 100.0, 15.0, step=0.1)
+            moisture = st.number_input("Moisture %", 0.0, 100.0, 8.0, step=0.1)
+        with fc2:
+            volatile = st.number_input("Volatile Matter %", 0.0, 100.0, 25.0, step=0.1)
+            fixed_carbon = st.number_input("Fixed Carbon %", 0.0, 100.0, 45.0, step=0.1)
+            gcv = st.number_input("GCV (kcal/kg)", 0, 10000, 5500, step=50)
+
+        st.markdown("##### Metadata")
+        fm1, fm2 = st.columns(2)
+        with fm1:
+            location = st.text_input("Location / Mine", placeholder="e.g. Jharia Coalfield")
+        with fm2:
+            evaluator = st.text_input("Evaluator Name", placeholder="e.g. Dr. Sharma")
+
+        remarks = st.text_area("Remarks", placeholder="Optional notes…", height=80)
+
+        submitted = st.form_submit_button("📤 Submit Entry", type="primary")
+
+    if submitted:
+        row = {
+            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Coal Grade": coal_grade,
+            "Ash %": ash,
+            "Moisture %": moisture,
+            "Volatile Matter %": volatile,
+            "Fixed Carbon %": fixed_carbon,
+            "GCV (kcal/kg)": gcv,
+            "Location / Mine": location or "—",
+            "Evaluator": evaluator or "—",
+            "Remarks": remarks or "—",
+        }
+        with st.spinner("Submitting to Google Sheets…"):
+            ok, msg = append_row(gsheets_conn, "Sheet1", EVAL_COLUMNS, row)
+        if ok:
+            st.success("✅ Entry submitted and cached data refreshed!", icon="✅")
+            st.balloons()
+        else:
+            st.error(msg, icon="❌")
+
+    st.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE: PROPOSAL EVALUATOR  (default — requires PDF uploads)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# File uploader lives in the main area when on the evaluator page
+if not st.session_state.get("_files_from_sidebar"):
+    # Show uploader in sidebar check
+    pass
+
+# We need the files — check the sidebar uploader
+uploaded_files = st.sidebar.file_uploader(
+    "Upload R&D Proposal PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+    help="Upload two or more PDF proposals to compare them.",
+    key="pdf_uploader_main",
+)
+
 if not uploaded_files:
     st.info(
         "👈  **Upload two or more PDF proposals** from the sidebar to get started.",
@@ -354,19 +620,19 @@ new_files = [f for f in uploaded_files if f.name not in st.session_state.process
 if new_files:
     for uf in new_files:
         try:
-            with st.status(f"Processing **{uf.name}** ...", expanded=True) as status:
-                st.write("Attempting digital text extraction (PyMuPDF)...")
+            with st.status(f"Processing **{uf.name}** …", expanded=True) as status:
+                st.write("Attempting digital text extraction (PyMuPDF)…")
                 metadata, is_ocr = extract_from_upload(uf)
 
                 if is_ocr:
                     st.info(
                         "Digital text layer not detected. "
-                        "Initializing OCR Engine for scanned document analysis...",
+                        "Initializing OCR Engine for scanned document analysis…",
                         icon="🔍",
                     )
 
                 st.write(f"Extraction method: **{metadata.get('extraction_method', 'Digital Text Layer')}**")
-                st.write("Calculating score...")
+                st.write("Calculating score…")
 
                 scored = calculate_score(metadata)
                 scored["keywords_all"] = metadata.get("keywords", [])
@@ -374,9 +640,9 @@ if new_files:
                 scored["extraction_method"] = metadata.get("extraction_method", "Digital Text Layer")
 
                 if is_ocr:
-                    existing = scored.get("justification", "")
+                    existing_j = scored.get("justification", "")
                     ocr_note = "Source: Scanned Image (OCR processed)"
-                    scored["justification"] = f"{ocr_note}. {existing}" if existing else ocr_note
+                    scored["justification"] = f"{ocr_note}. {existing_j}" if existing_j else ocr_note
 
                 st.session_state.scored_proposals.append(scored)
                 st.session_state.processed_names.add(uf.name)
@@ -386,23 +652,17 @@ if new_files:
             st.error(
                 f"**OCR Error for {uf.name}:** {exc}\n\n"
                 "**How to fix:**\n"
-                "1. Install Python packages: `pip install pytesseract pdf2image Pillow`\n"
-                "2. Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) "
-                "and add it to your system PATH.\n"
-                "3. Install [Poppler](https://github.com/oschwartz10612/poppler-windows) "
-                "(Windows) and add it to your system PATH.",
+                "1. `pip install pytesseract pdf2image Pillow`\n"
+                "2. Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) → system PATH\n"
+                "3. Install [Poppler](https://github.com/oschwartz10612/poppler-windows) → system PATH",
                 icon="⚠️",
             )
         except Exception as exc:
-            err_name = type(exc).__name__
-            if "TesseractNotFound" in err_name:
+            if "TesseractNotFound" in type(exc).__name__:
                 st.error(
                     f"**Tesseract OCR not found** while processing **{uf.name}**.\n\n"
-                    "The scanned PDF requires OCR, but Tesseract is not installed.\n\n"
-                    "**How to fix:**\n"
-                    "1. Download and install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract).\n"
-                    "2. Ensure the `tesseract` executable is on your system PATH.\n"
-                    "3. Restart the Streamlit app.",
+                    "Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) "
+                    "and ensure `tesseract` is on your system PATH.",
                     icon="⚠️",
                 )
             else:
@@ -429,7 +689,7 @@ titles = list(title_map.keys())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TABS
+#  EVALUATOR TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 tab_dash, tab_analytics, tab_compare = st.tabs([
@@ -444,7 +704,6 @@ tab_dash, tab_analytics, tab_compare = st.tabs([
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_dash:
 
-    # ── Winner callout ───────────────────────────────────────────────────
     best_proposal = proposals_ranked[0]
     st.success(
         f"🏆 **#1 Ranked Proposal:** {best_proposal['title']}  "
@@ -465,7 +724,11 @@ with tab_dash:
         default=None,
     )
 
-    m1, m2, m3 = st.columns(3)
+    m0, m1, m2, m3 = st.columns(4)
+    with m0:
+        st.metric(label="📋 Total Proposals",
+                  value=str(len(proposals_ranked)),
+                  delta="Processed")
     with m1:
         st.metric(label="🏆 Top Score",
                   value=f"{best['total_score']} pts",
@@ -484,7 +747,6 @@ with tab_dash:
 
     # ── Ranked table ─────────────────────────────────────────────────────
     st.markdown("### Ranked Proposals")
-
     df = pd.DataFrame([
         {
             "Rank": idx,
@@ -511,7 +773,6 @@ with tab_dash:
         },
     )
 
-    # ── CSV Export ────────────────────────────────────────────────────────
     csv_data = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="📥 Download Leaderboard as CSV",
@@ -522,7 +783,7 @@ with tab_dash:
 
     # ── Submit to Google Sheets ──────────────────────────────────────────
     st.markdown("---")
-    if gsheets_conn and not gsheets_error:
+    if _gsheets_online:
         st.markdown("### 🗄️ Submit to Ministry Database")
         submit_choice = st.selectbox(
             "Select proposal to submit",
@@ -530,15 +791,19 @@ with tab_dash:
             key="submit_select",
         )
         if st.button("📤 Submit to Ministry Database", type="primary"):
-            with st.spinner("Writing to Google Sheets..."):
+            with st.spinner("Writing to Google Sheets…"):
                 success = submit_to_sheets(gsheets_conn, title_map[submit_choice])
             if success:
                 st.success(
-                    f"**{submit_choice}** submitted successfully to the Ministry database!",
+                    f"**{submit_choice}** submitted to the Ministry database!",
                     icon="✅",
                 )
             else:
-                st.error("Failed to write to Google Sheets. Check your connection.", icon="❌")
+                st.error(
+                    "Failed to write to Google Sheets.\n\n"
+                    f"Ensure `{SERVICE_ACCOUNT_EMAIL}` has **Editor** access.",
+                    icon="❌",
+                )
     else:
         st.info(
             "**Database persistence is offline.** Configure Google Sheets "
@@ -550,7 +815,6 @@ with tab_dash:
     # ── Detailed view ────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### Detailed Proposal View")
-
     selected = st.selectbox("Select a proposal to inspect", titles, key="detail_select")
     if selected:
         render_proposal_card(title_map[selected])
@@ -568,7 +832,6 @@ with tab_analytics:
     )
     st.markdown("")
 
-    # Responsive grid: 2 columns for side-by-side display
     cols = st.columns(2)
     for idx, scored in enumerate(proposals_ranked):
         with cols[idx % 2]:
