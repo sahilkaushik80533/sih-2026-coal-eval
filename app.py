@@ -508,7 +508,7 @@ with st.sidebar:
         st.success("Google Sheets: **Connected**", icon="🟢")
         sheet_url = st.secrets.get("connections", {}).get("gsheets", {}).get("spreadsheet", "")
         if sheet_url:
-            st.caption(f"📄 {sheet_url[:55]}…")
+            st.markdown(f"**[🔗 Open Google Sheet]({sheet_url})**")
         st.caption(f"👤 `{SERVICE_ACCOUNT_EMAIL}`")
     else:
         st.warning("Google Sheets: **Offline Mode**", icon="🔴")
