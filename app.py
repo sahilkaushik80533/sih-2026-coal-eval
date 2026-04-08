@@ -30,6 +30,7 @@ Data Caching Strategy
 
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 from datetime import datetime
@@ -47,6 +48,16 @@ from proposal_ranker import (
     PRIORITY_KEYWORDS,
 )
 
+# ── Google Drive API (for PDF uploads — no temp files) ───────────────────────
+try:
+    from google.oauth2.service_account import Credentials as SACredentials
+    from googleapiclient.discovery import build as build_service
+    from googleapiclient.http import MediaIoBaseUpload
+
+    _DRIVE_LIB_AVAILABLE = True
+except ImportError:
+    _DRIVE_LIB_AVAILABLE = False
+
 # ── Google Sheets (soft import — works without credentials) ──────────────────
 try:
     from streamlit_gsheets import GSheetsConnection
@@ -57,10 +68,12 @@ except ImportError:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 SERVICE_ACCOUNT_EMAIL = "sih-robot@sih-coal-eval.iam.gserviceaccount.com"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 #: Columns for the coal-evaluation records worksheet.
 EVAL_COLUMNS: list[str] = [
     "Timestamp",
+    "Proposal Name",
     "Coal Grade",
     "Ash %",
     "Moisture %",
@@ -70,6 +83,7 @@ EVAL_COLUMNS: list[str] = [
     "Location / Mine",
     "Evaluator",
     "Remarks",
+    "PDF Link",
 ]
 
 #: Columns for the proposal-submission worksheet.
@@ -339,6 +353,104 @@ def append_row(conn, worksheet: str, columns: list[str],
                 "`.streamlit/secrets.toml`."
             )
         return False, f"Write failed: {exc}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GOOGLE DRIVE — PDF UPLOAD (byte-streaming, no temp files)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _build_drive_service():
+    """
+    Build a Google Drive API v3 service using the same service-account
+    credentials stored in ``st.secrets``.
+
+    Returns (service, error_msg).
+    """
+    if not _DRIVE_LIB_AVAILABLE:
+        return None, (
+            "`google-api-python-client` / `google-auth` not installed.\n\n"
+            "Run: `pip install google-api-python-client google-auth`"
+        )
+    try:
+        gs = st.secrets["connections"]["gsheets"]
+        info = {
+            "type": gs.get("type", "service_account"),
+            "project_id": gs.get("project_id", ""),
+            "private_key_id": gs.get("private_key_id", ""),
+            "private_key": gs.get("private_key", ""),
+            "client_email": gs.get("client_email", ""),
+            "client_id": gs.get("client_id", ""),
+            "auth_uri": gs.get("auth_uri", ""),
+            "token_uri": gs.get("token_uri", ""),
+            "auth_provider_x509_cert_url": gs.get("auth_provider_x509_cert_url", ""),
+            "client_x509_cert_url": gs.get("client_x509_cert_url", ""),
+        }
+        creds = SACredentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+        service = build_service("drive", "v3", credentials=creds)
+        return service, None
+    except Exception as exc:
+        return None, f"Drive auth failed: {exc}"
+
+
+def upload_pdf_to_drive(
+    file_bytes: bytes,
+    filename: str,
+    folder_id: str,
+) -> tuple[str | None, str]:
+    """
+    Upload *file_bytes* as a PDF to Google Drive *folder_id*.
+
+    Streams bytes directly via ``MediaIoBaseUpload`` — **no temp files**.
+
+    Returns
+    -------
+    (shareable_url | None, message)
+    """
+    service, err = _build_drive_service()
+    if err:
+        return None, err
+
+    try:
+        file_metadata = {
+            "name": filename,
+            "mimeType": "application/pdf",
+            "parents": [folder_id],
+        }
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_bytes),
+            mimetype="application/pdf",
+            resumable=True,
+        )
+        uploaded = (
+            service.files()
+            .create(body=file_metadata, media_body=media, fields="id,webViewLink")
+            .execute()
+        )
+
+        # Make the file viewable by anyone with the link
+        service.permissions().create(
+            fileId=uploaded["id"],
+            body={"role": "reader", "type": "anyone"},
+        ).execute()
+
+        link = uploaded.get("webViewLink", f"https://drive.google.com/file/d/{uploaded['id']}/view")
+        return link, f"Uploaded **{filename}** to Google Drive."
+
+    except Exception as exc:
+        err_str = str(exc).lower()
+        if "permission" in err_str or "403" in err_str:
+            return None, (
+                f"**Drive permission denied.** Share the target folder with "
+                f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**, or check that "
+                "the Google Drive API is enabled in your GCP project."
+            )
+        if "not found" in err_str or "404" in err_str:
+            return None, (
+                "**Drive folder not found (404).** Verify `drive_folder_id` "
+                "in `.streamlit/secrets.toml`."
+            )
+        return None, f"Drive upload failed: {exc}"
 
 
 # Legacy wrapper used by the Dashboard tab's "Submit to Ministry" button.
@@ -619,12 +731,31 @@ if nav == "➕ New Entry":
         )
         st.stop()
 
+    # Read Drive folder ID from secrets (optional — empty = skip upload)
+    _drive_folder_id = (
+        st.secrets.get("drive", {}).get("folder_id", "")
+    )
+
     st.caption(
-        "Fill in the coal sample evaluation form below. All data is appended "
-        "to the connected Google Sheet in real-time."
+        "Fill in the coal sample evaluation form below. Data is appended "
+        "to the connected Google Sheet. If a PDF is attached, it is "
+        "uploaded to Google Drive and the link is saved with the record."
     )
 
     with st.form("coal_entry_form", clear_on_submit=True):
+        # ── Proposal & PDF ───────────────────────────────────────────
+        st.markdown("##### Proposal")
+        proposal_name = st.text_input(
+            "Proposal Name",
+            placeholder="e.g. Underground Methane Capture — Phase II",
+        )
+        pdf_file = st.file_uploader(
+            "Attach Proposal PDF (optional)",
+            type=["pdf"],
+            help="The PDF will be uploaded to Google Drive and linked in the record.",
+        )
+
+        # ── Sample Details ───────────────────────────────────────────
         st.markdown("##### Sample Details")
         fc1, fc2 = st.columns(2)
         with fc1:
@@ -641,6 +772,7 @@ if nav == "➕ New Entry":
             fixed_carbon = st.number_input("Fixed Carbon %", 0.0, 100.0, 45.0, step=0.1)
             gcv = st.number_input("GCV (kcal/kg)", 0, 10000, 5500, step=50)
 
+        # ── Metadata ─────────────────────────────────────────────────
         st.markdown("##### Metadata")
         fm1, fm2 = st.columns(2)
         with fm1:
@@ -653,8 +785,39 @@ if nav == "➕ New Entry":
         submitted = st.form_submit_button("📤 Submit Entry", type="primary")
 
     if submitted:
+        pdf_link = "—"
+
+        # ── Step 1: Upload PDF to Drive (if provided + folder configured)
+        if pdf_file is not None:
+            if not _drive_folder_id:
+                st.warning(
+                    "PDF attached but `drive.folder_id` is not set in "
+                    "`secrets.toml`. Skipping Drive upload.",
+                    icon="⚠️",
+                )
+            elif not _DRIVE_LIB_AVAILABLE:
+                st.warning(
+                    "PDF attached but `google-api-python-client` is not "
+                    "installed. Skipping Drive upload.",
+                    icon="⚠️",
+                )
+            else:
+                with st.spinner("Uploading PDF to Google Drive…"):
+                    link, drive_msg = upload_pdf_to_drive(
+                        pdf_file.getvalue(),
+                        pdf_file.name,
+                        _drive_folder_id,
+                    )
+                if link:
+                    pdf_link = link
+                    st.success(f"📄 PDF uploaded: [View on Drive]({link})", icon="✅")
+                else:
+                    st.error(drive_msg, icon="❌")
+
+        # ── Step 2: Append row to Google Sheet ───────────────────────
         row = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Proposal Name": proposal_name or "—",
             "Coal Grade": coal_grade,
             "Ash %": ash,
             "Moisture %": moisture,
@@ -664,6 +827,7 @@ if nav == "➕ New Entry":
             "Location / Mine": location or "—",
             "Evaluator": evaluator or "—",
             "Remarks": remarks or "—",
+            "PDF Link": pdf_link,
         }
         with st.spinner("Submitting to Google Sheets…"):
             ok, msg = append_row(gsheets_conn, "Sheet1", EVAL_COLUMNS, row)
