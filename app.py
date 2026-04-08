@@ -614,20 +614,23 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Database Settings ────────────────────────────────────────────────
-    st.markdown("### 🗄️ Database Settings")
+    # ── System Status ─────────────────────────────────────────────────────
+    st.markdown("### ⚙️ System Status")
     if _gsheets_online:
-        st.success("Google Sheets: **Connected**", icon="🟢")
+        st.success("Database: **Connected**", icon="🟢")
+
+        # Professional link buttons (no raw URLs or metadata exposed)
         sheet_url = st.secrets.get("connections", {}).get("gsheets", {}).get("spreadsheet", "")
+        drive_folder_id = st.secrets.get("drive", {}).get("folder_id", "")
+
         if sheet_url:
-            st.markdown(f"**[🔗 Open Google Sheet]({sheet_url})**")
-        st.caption(f"👤 `{SERVICE_ACCOUNT_EMAIL}`")
+            st.link_button("📊 Open Evaluation Sheet", sheet_url, use_container_width=True)
+        if drive_folder_id:
+            drive_url = f"https://drive.google.com/drive/folders/{drive_folder_id}"
+            st.link_button("📁 Open Document Vault", drive_url, use_container_width=True)
     else:
-        st.warning("Google Sheets: **Offline Mode**", icon="🔴")
-        if gsheets_error:
-            st.caption(gsheets_error[:120])
-        else:
-            st.caption("Configure `.streamlit/secrets.toml` to enable persistence.")
+        st.error("Database: **Offline**", icon="🔴")
+        st.caption("Contact administrator to restore connectivity.")
 
     st.markdown("---")
     st.caption("SIH 2026 · Built with Streamlit")
