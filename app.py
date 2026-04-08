@@ -149,35 +149,92 @@ st.markdown(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _validate_secrets() -> str | None:
+    """
+    Pre-flight check: make sure the critical secrets fields are filled in.
+
+    Returns None if everything looks good, or an error message string.
+    """
+    try:
+        gs = st.secrets["connections"]["gsheets"]
+    except (KeyError, FileNotFoundError):
+        return (
+            "**Secrets not configured.** Create `.streamlit/secrets.toml` "
+            "with your Google Sheets credentials.\n\n"
+            "See the template shipped with this project for the exact format."
+        )
+
+    spreadsheet_url = gs.get("spreadsheet", "")
+    private_key = gs.get("private_key", "")
+    client_email = gs.get("client_email", "")
+
+    missing = []
+    if not spreadsheet_url:
+        missing.append("`spreadsheet` (full Google Sheet URL)")
+    if not private_key:
+        missing.append("`private_key` (from your JSON key file)")
+    if not client_email:
+        missing.append("`client_email` (service account email)")
+
+    if missing:
+        items = "\n".join(f"  - {m}" for m in missing)
+        return (
+            f"**Incomplete credentials.** The following fields in "
+            f"`.streamlit/secrets.toml` are empty:\n\n{items}\n\n"
+            "Fill them in from your GCP service-account JSON key file."
+        )
+    return None
+
+
 def _get_gsheets_connection():
     """
-    Establish a Google Sheets connection.
+    Establish and validate a Google Sheets connection.
 
     Returns
     -------
     (conn, error_msg) : tuple
         conn is a GSheetsConnection or None; error_msg explains the failure.
+
+    The function runs three checks:
+      1. Library installed?
+      2. Secrets filled in?  (catches the "File not found" for empty URLs)
+      3. Validation ping — actually reads the sheet to catch 403 / 404 early.
     """
     if not _GSHEETS_LIB_AVAILABLE:
         return None, (
             "`st-gsheets-connection` is not installed.\n\n"
             "Run: `pip install st-gsheets-connection`"
         )
+
+    # ── Step 1: Validate secrets before even trying to connect ────────
+    secrets_err = _validate_secrets()
+    if secrets_err:
+        return None, secrets_err
+
+    # ── Step 2: Create the connection object ──────────────────────────
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
-        return conn, None
+    except Exception as exc:
+        return None, f"Connection init failed: {exc}"
+
+    # ── Step 3: Validation ping — try reading 0 rows ─────────────────
+    #   This surfaces 403/404/FileNotFound immediately instead of letting
+    #   them appear later in fetch_sheet_data() or append_row().
+    try:
+        conn.read(worksheet="Sheet1", usecols=[0], ttl=5)
     except FileNotFoundError:
         return None, (
-            "**Spreadsheet not found.** The URL in `secrets.toml` may be "
+            "**Spreadsheet not found.** The URL in `secrets.toml` is "
             "incorrect or the sheet has been deleted.\n\n"
-            "Please verify `[connections.gsheets] → spreadsheet` in "
-            "`.streamlit/secrets.toml`."
+            "Open `.streamlit/secrets.toml` and set `spreadsheet` to the "
+            "full URL of your Google Sheet\n"
+            "(e.g. `https://docs.google.com/spreadsheets/d/…/edit`)."
         )
     except PermissionError:
         return None, (
             "**Permission denied.** The service account does not have "
             "editor access to the Google Sheet.\n\n"
-            "**Fix:** Open your Google Sheet → Share → add "
+            "**Fix:** Open your Google Sheet → **Share** → add\n"
             f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**."
         )
     except Exception as exc:
@@ -186,15 +243,23 @@ def _get_gsheets_connection():
             return None, (
                 f"**Permission denied (403).** The service account "
                 f"`{SERVICE_ACCOUNT_EMAIL}` does not have access.\n\n"
-                "**Fix:** Open your Google Sheet → Share → add "
+                "**Fix:** Open your Google Sheet → **Share** → add\n"
                 f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**."
             )
         if "not found" in err_str or "404" in err_str:
             return None, (
-                "**Sheet not found (404).** Check the spreadsheet URL in "
+                "**Sheet not found (404).** Verify the `spreadsheet` URL in "
                 "`.streamlit/secrets.toml`."
             )
-        return None, f"Connection failed: {exc}"
+        if "file not found" in err_str or "no such file" in err_str:
+            return None, (
+                "**Spreadsheet not found.** The URL in `secrets.toml` "
+                "appears to be invalid.\n\n"
+                "Set `spreadsheet` to the full URL of your Google Sheet."
+            )
+        return None, f"Connection validation failed: {exc}"
+
+    return conn, None
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -208,10 +273,25 @@ def fetch_sheet_data(_conn, worksheet: str = "Sheet1") -> pd.DataFrame | None:
     try:
         data = _conn.read(worksheet=worksheet)
         if data is not None and not data.empty:
-            # Drop fully‐NaN rows that gsheets sometimes returns
             data = data.dropna(how="all")
         return data
-    except Exception:
+    except FileNotFoundError:
+        st.error(
+            "**Spreadsheet not found.** The URL in `secrets.toml` may be "
+            "incorrect.\n\nVerify `spreadsheet` in `.streamlit/secrets.toml`.",
+            icon="🔴",
+        )
+        return None
+    except Exception as exc:
+        err = str(exc).lower()
+        if "permission" in err or "403" in err:
+            st.error(
+                f"**Permission denied.** Share the Google Sheet with "
+                f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**.",
+                icon="🔴",
+            )
+        else:
+            st.error(f"Failed to read sheet: {exc}", icon="❌")
         return None
 
 
@@ -236,6 +316,11 @@ def append_row(conn, worksheet: str, columns: list[str],
         # Bust the cache so the View tab refreshes immediately
         st.cache_data.clear()
         return True, "Row appended successfully."
+    except FileNotFoundError:
+        return False, (
+            "**Spreadsheet not found.** Verify the `spreadsheet` URL in "
+            "`.streamlit/secrets.toml`."
+        )
     except PermissionError:
         return False, (
             f"**Permission denied.** Share the sheet with "
@@ -247,6 +332,11 @@ def append_row(conn, worksheet: str, columns: list[str],
             return False, (
                 f"**Permission denied (403).** Share the sheet with "
                 f"`{SERVICE_ACCOUNT_EMAIL}` as Editor."
+            )
+        if "not found" in err or "404" in err:
+            return False, (
+                "**Sheet not found.** Verify the `spreadsheet` URL in "
+                "`.streamlit/secrets.toml`."
             )
         return False, f"Write failed: {exc}"
 
