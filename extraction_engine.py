@@ -91,6 +91,14 @@ DOMAIN_KEYWORDS: list[str] = [
     "Pit Lake Management",
 ]
 
+#: Indian coal grade classifications and technical coal types.
+COAL_GRADES: list[str] = [
+    "Grade A", "Grade B", "Grade C", "Grade D", "Grade E", "Grade F", "Grade G",
+    "Semi-Coking", "Coking Coal", "Non-Coking", "Washery Grade",
+    "Anthracite", "Bituminous", "Sub-Bituminous", "Lignite", "Peat",
+    "Thermal Coal", "Metallurgical Coal", "Steam Coal",
+]
+
 NOT_DETECTED = "Not Detected"
 
 #: If the digital text layer has fewer characters than this, trigger OCR.
@@ -374,6 +382,95 @@ def _extract_keywords(text: str) -> list[str]:
     return sorted(found) if found else []
 
 
+def _extract_coal_grade(text: str) -> str:
+    """
+    Detect Indian coal grade or coal type from the text.
+
+    Checks for explicit labels first ("Coal Grade: C"), then scans
+    for any mention of known grades/types from ``COAL_GRADES``.
+    If multiple are found, returns the first (highest-confidence) match.
+    """
+    # Strategy 1: explicit label ("Coal Grade: D", "Grade: Semi-Coking")
+    label_pat = r"(?:Coal\s+)?Grade\s*[:\-–]\s*([A-G]|\w[\w\s-]{2,30})"
+    m = re.search(label_pat, text, re.IGNORECASE)
+    if m:
+        grade = m.group(1).strip().rstrip(".,:;")
+        # If it's a single letter, normalise to "Grade X" for clarity
+        if len(grade) == 1 and grade.upper() in "ABCDEFG":
+            return grade.upper()
+        return grade.title()
+
+    # Strategy 2: scan for known grades/types
+    for grade in COAL_GRADES:
+        if re.search(rf"\b{re.escape(grade)}\b", text, re.IGNORECASE):
+            # Return the canonical form from the list
+            return grade
+
+    return NOT_DETECTED
+
+
+def _extract_organization(text: str) -> str:
+    """
+    Extract the lead researcher's organization / institution.
+
+    Looks for IIT, NIT, IISC, CSIR, CMPDI, CMPDIL, university names, etc.
+    """
+    patterns = [
+        r"(?:Organization|Institution|Affiliation|Institute|University)\s*[:\-–]\s*(.+?)(?:\n|$)",
+        r"Submitted\s+(?:from|by)\s*[:\-–]?\s*(?:Dr\.?\s+\w+\s*,?\s*)?(.+?)(?:\n|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().rstrip(".,:;")
+
+    # Scan for known Indian research institutions
+    inst_patterns = [
+        r"(IIT\s+\w+)",
+        r"(NIT\s+\w+)",
+        r"(IISc\b[\w\s]*)",
+        r"(CSIR[\-\s]+\w[\w\s]*)",
+        r"(CMPDI(?:L)?)",
+        r"(Indian\s+School\s+of\s+Mines)",
+        r"(ISM\s+Dhanbad)",
+        r"(Central\s+Mine\s+Planning[\w\s]*)",
+        r"(\w+\s+University)",
+        r"(\w+\s+Institute\s+of\s+Technology)",
+    ]
+    for pat in inst_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+
+    return NOT_DETECTED
+
+
+# ── ML-Ready Text Normalisation ─────────────────────────────────────────────
+
+def normalize_text(text: str) -> str:
+    """
+    Deep-clean text for downstream ML training / NLP pipelines.
+
+    Operations:
+    - Convert to lowercase
+    - Strip accents and special Unicode characters
+    - Replace currency symbols with tokens (₹ → INR)
+    - Collapse all whitespace
+    - Remove non-alphanumeric characters (keep spaces, periods, hyphens)
+    """
+    import unicodedata
+
+    # Normalise Unicode (NFD) and strip accent marks
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+
+    text = text.lower()
+    text = text.replace("₹", "INR ").replace("rs.", "INR ").replace("rs ", "INR ")
+    text = re.sub(r"[^a-z0-9\s.\-,%]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 def extract_metadata(pdf_path: str) -> dict[str, Any]:
@@ -401,12 +498,17 @@ def extract_metadata(pdf_path: str) -> dict[str, Any]:
     timeline = _extract_timeline(text)
     keywords = _extract_keywords(text)
 
+    coal_grade = _extract_coal_grade(text)
+    organization = _extract_organization(text)
+
     return {
         "source_file": os.path.basename(pdf_path),
         "project_title": title,
         "principal_investigator": pi,
+        "organization": organization,
         "budget": budget,
         "timeline": timeline,
+        "coal_grade": coal_grade,
         "keywords": keywords if keywords else NOT_DETECTED,
         "extraction_method": "OCR (Scanned Document)" if is_ocr else "Digital Text Layer",
     }
@@ -436,14 +538,97 @@ def print_summary(data: dict[str, Any]) -> None:
     print(f"  Extraction   : {data.get('extraction_method', 'Digital Text Layer')}")
     print(f"  Title        : {data['project_title']}")
     print(f"  PI           : {data['principal_investigator']}")
+    print(f"  Organization : {data.get('organization', 'Not Detected')}")
     print(f"  Budget       : {data['budget']}")
     print(f"  Timeline     : {data['timeline']}")
+    print(f"  Coal Grade   : {data.get('coal_grade', 'Not Detected')}")
     kw = data["keywords"]
     if isinstance(kw, list):
         print(f"  Keywords     : {', '.join(kw)}")
     else:
         print(f"  Keywords     : {kw}")
     print("=" * width)
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
+
+# ── Smart Extraction for Form Pre-Fill ───────────────────────────────────────
+
+#: Maps detected coal grade strings → form selectbox values.
+_GRADE_FORM_MAP: dict[str, str] = {
+    "a": "A", "b": "B", "c": "C", "d": "D", "e": "E", "f": "F", "g": "G",
+    "grade a": "A", "grade b": "B", "grade c": "C", "grade d": "D",
+    "grade e": "E", "grade f": "F", "grade g": "G",
+    "semi-coking": "Semi-Coking", "coking coal": "Coking", "coking": "Coking",
+    "non-coking": "Washery", "washery grade": "Washery", "washery": "Washery",
+    "anthracite": "A", "bituminous": "C", "sub-bituminous": "D",
+    "lignite": "F", "peat": "G",
+    "thermal coal": "D", "metallurgical coal": "Coking", "steam coal": "D",
+}
+
+
+def smart_extract_for_form(pdf_path: str) -> dict[str, Any]:
+    """
+    Run the full extraction pipeline and return a dict whose keys match
+    the New Entry form fields in ``app.py``.
+
+    This is the **Smart Extraction** entry point — it extracts, cleans,
+    and maps all fields so the form can be pre-filled, minimising manual
+    data entry.
+
+    Returns
+    -------
+    dict with keys:
+        proposal_name, coal_grade, location, evaluator, remarks,
+        extraction_method, confidence_flags
+    """
+    metadata = extract_metadata(pdf_path)
+
+    # ── Map coal_grade → form selectbox value ────────────────────────
+    raw_grade = metadata.get("coal_grade", NOT_DETECTED)
+    form_grade = _GRADE_FORM_MAP.get(raw_grade.lower(), None)
+    if form_grade is None and raw_grade != NOT_DETECTED:
+        # Partial match: check if any key is a substring
+        for key, val in _GRADE_FORM_MAP.items():
+            if key in raw_grade.lower():
+                form_grade = val
+                break
+    form_grade = form_grade or "D"  # sensible default
+
+    # ── Build confidence flags (which fields were actually detected) ──
+    flags: dict[str, bool] = {
+        "title": metadata["project_title"] != NOT_DETECTED,
+        "pi": metadata["principal_investigator"] != NOT_DETECTED,
+        "organization": metadata.get("organization", NOT_DETECTED) != NOT_DETECTED,
+        "budget": metadata["budget"] != NOT_DETECTED,
+        "timeline": metadata["timeline"] != NOT_DETECTED,
+        "coal_grade": metadata.get("coal_grade", NOT_DETECTED) != NOT_DETECTED,
+    }
+    detected_count = sum(flags.values())
+    total_fields = len(flags)
+
+    # ── Compose the form-ready dict ──────────────────────────────────
+    return {
+        # Direct form fields
+        "proposal_name": metadata["project_title"] if flags["title"] else "",
+        "coal_grade": form_grade,
+        "location": metadata.get("organization", "") if flags["organization"] else "",
+        "evaluator": metadata["principal_investigator"] if flags["pi"] else "",
+        "remarks": (
+            f"Budget: {metadata['budget']} | "
+            f"Timeline: {metadata['timeline']} | "
+            f"Keywords: {', '.join(metadata['keywords']) if isinstance(metadata['keywords'], list) else metadata['keywords']}"
+        ),
+        # Metadata for display
+        "extraction_method": metadata["extraction_method"],
+        "raw_budget": metadata["budget"],
+        "raw_timeline": metadata["timeline"],
+        "raw_coal_grade": metadata.get("coal_grade", NOT_DETECTED),
+        "raw_organization": metadata.get("organization", NOT_DETECTED),
+        "keywords": metadata["keywords"],
+        "confidence_flags": flags,
+        "confidence_score": f"{detected_count}/{total_fields}",
+    }
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────

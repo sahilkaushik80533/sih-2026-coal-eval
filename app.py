@@ -30,6 +30,7 @@ Data Caching Strategy
 
 from __future__ import annotations
 
+import fitz  
 import io
 import os
 import tempfile
@@ -41,7 +42,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ── Local module imports ─────────────────────────────────────────────────────
-from extraction_engine import extract_metadata
+from extraction_engine import extract_metadata, smart_extract_for_form
 from proposal_ranker import (
     calculate_score,
     parse_budget,
@@ -82,9 +83,36 @@ EVAL_COLUMNS: list[str] = [
     "GCV (kcal/kg)",
     "Location / Mine",
     "Evaluator",
-    "Remarks",
+    "Technical Innovation",
+    "Economic Viability",
+    "Environmental Sustainability",
+    "Ministry Alignment",
+    "Total Score",
     "PDF Link",
 ]
+
+#: Weights for evaluation scoring (must sum to 1.0).
+SCORE_WEIGHTS: dict[str, float] = {
+    "Technical Innovation": 0.30,
+    "Economic Viability": 0.25,
+    "Environmental Sustainability": 0.25,
+    "Ministry Alignment": 0.20,
+}
+
+
+def calculate_eval_score(
+    innovation: int, economic: int, environmental: int, alignment: int,
+) -> float:
+    """Compute weighted total score (0–100) from four 1–10 sliders."""
+    raw = (
+        innovation * SCORE_WEIGHTS["Technical Innovation"]
+        + economic * SCORE_WEIGHTS["Economic Viability"]
+        + environmental * SCORE_WEIGHTS["Environmental Sustainability"]
+        + alignment * SCORE_WEIGHTS["Ministry Alignment"]
+    )
+    # Normalise: sliders are 1–10, so max raw = 10, min raw = 1
+    # Map to 0–100 scale: (raw - 1) / (10 - 1) * 100
+    return round((raw - 1) / 9 * 100, 1)
 
 #: Columns for the proposal-submission worksheet.
 PROPOSAL_COLUMNS: list[str] = [
@@ -656,7 +684,7 @@ st.markdown(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if nav == "📋 View Records":
-    st.markdown("### 📋 Coal Evaluation Records — Google Sheets")
+    st.markdown("### 📋 Coal Evaluation Leaderboard")
 
     if not _gsheets_online:
         st.error(
@@ -672,25 +700,55 @@ if nav == "📋 View Records":
     if sheet_df is None or sheet_df.empty:
         st.info("The Google Sheet is empty — no records to display yet.", icon="📭")
     else:
-        # ── Summary metrics ──────────────────────────────────────────────
-        vm1, vm2, vm3 = st.columns(3)
+        # Ensure Total Score is numeric for sorting
+        if "Total Score" in sheet_df.columns:
+            sheet_df["Total Score"] = pd.to_numeric(
+                sheet_df["Total Score"], errors="coerce"
+            ).fillna(0)
+            sheet_df = sheet_df.sort_values("Total Score", ascending=False).reset_index(drop=True)
+
+        # Ensure Innovation is numeric for metrics
+        if "Technical Innovation" in sheet_df.columns:
+            sheet_df["Technical Innovation"] = pd.to_numeric(
+                sheet_df["Technical Innovation"], errors="coerce"
+            ).fillna(0)
+
+        # ── Metrics Summary ──────────────────────────────────────────────
+        vm1, vm2, vm3, vm4 = st.columns(4)
         with vm1:
-            st.metric("📋 Total Records", len(sheet_df))
+            st.metric("📋 Total Proposals", len(sheet_df))
         with vm2:
-            # Show unique coal grades if the column exists
-            if "Coal Grade" in sheet_df.columns:
-                st.metric("⛏️ Unique Grades", sheet_df["Coal Grade"].nunique())
-            elif "Title" in sheet_df.columns:
-                st.metric("📑 Unique Titles", sheet_df["Title"].nunique())
+            if "Technical Innovation" in sheet_df.columns:
+                avg_inn = sheet_df["Technical Innovation"].mean()
+                st.metric("💡 Avg Innovation", f"{avg_inn:.1f} / 10")
             else:
-                st.metric("📊 Columns", len(sheet_df.columns))
+                st.metric("⛏️ Grades", sheet_df["Coal Grade"].nunique() if "Coal Grade" in sheet_df.columns else "—")
         with vm3:
-            if "Timestamp" in sheet_df.columns:
-                st.metric("🕐 Latest Entry", str(sheet_df["Timestamp"].iloc[-1])[:16])
+            if "Total Score" in sheet_df.columns and len(sheet_df) > 0:
+                top_score = sheet_df["Total Score"].max()
+                st.metric("🏆 Top Score", f"{top_score:.1f} / 100")
             else:
-                st.metric("📊 Rows", len(sheet_df))
+                st.metric("🏆 Top Score", "—")
+        with vm4:
+            if "Location / Mine" in sheet_df.columns:
+                top_org = sheet_df.loc[
+                    sheet_df.get("Total Score", pd.Series(dtype=float)).idxmax(),
+                    "Location / Mine",
+                ] if "Total Score" in sheet_df.columns and len(sheet_df) > 0 else "—"
+                st.metric("🏢 Top Organization", str(top_org)[:25])
+            else:
+                st.metric("🕐 Latest", str(sheet_df["Timestamp"].iloc[-1])[:16] if "Timestamp" in sheet_df.columns else "—")
 
         st.markdown("")
+
+        # ── Winner callout ────────────────────────────────────────────────
+        if "Total Score" in sheet_df.columns and len(sheet_df) > 0:
+            winner = sheet_df.iloc[0]
+            st.success(
+                f"🏆 **#1 Proposal:** {winner.get('Proposal Name', '—')}  "
+                f"— Score: **{winner.get('Total Score', 0):.1f} / 100**",
+                icon="🏆",
+            )
 
         # ── Search / filter ──────────────────────────────────────────────
         search_term = st.text_input(
@@ -698,7 +756,7 @@ if nav == "📋 View Records":
             placeholder="Type to filter across all columns…",
             key="view_search",
         )
-        display_df = sheet_df
+        display_df = sheet_df.copy()
         if search_term:
             mask = sheet_df.astype(str).apply(
                 lambda col: col.str.contains(search_term, case=False, na=False)
@@ -706,13 +764,40 @@ if nav == "📋 View Records":
             display_df = sheet_df[mask]
             st.caption(f"Showing {len(display_df)} of {len(sheet_df)} records.")
 
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        # Add rank column
+        display_df = display_df.copy()
+        display_df.insert(0, "Rank", range(1, len(display_df) + 1))
+
+        # ── Styled dataframe with gradient on Total Score ────────────────
+        score_cols = [c for c in ["Total Score", "Technical Innovation",
+                                   "Economic Viability", "Environmental Sustainability",
+                                   "Ministry Alignment"] if c in display_df.columns]
+
+        styled = display_df.style
+        if "Total Score" in display_df.columns:
+            styled = styled.background_gradient(
+                subset=["Total Score"],
+                cmap="RdYlGn",
+                vmin=0,
+                vmax=100,
+            )
+
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Rank": st.column_config.NumberColumn(width="small"),
+                "Total Score": st.column_config.NumberColumn(format="%.1f"),
+                "PDF Link": st.column_config.LinkColumn(display_text="📄 View"),
+            },
+        )
 
         # ── CSV download ─────────────────────────────────────────────────
         st.download_button(
-            "📥 Export as CSV",
+            "📥 Export Leaderboard as CSV",
             data=display_df.to_csv(index=False).encode("utf-8"),
-            file_name="coal_eval_records.csv",
+            file_name="coal_eval_leaderboard.csv",
             mime="text/csv",
         )
 
@@ -734,11 +819,73 @@ if nav == "➕ New Entry":
         )
         st.stop()
 
-    # Read Drive folder ID from secrets (optional — empty = skip upload)
-    _drive_folder_id = (
-        st.secrets.get("drive", {}).get("folder_id", "")
-    )
+    _drive_folder_id = st.secrets.get("drive", {}).get("folder_id", "")
 
+    # ═══ SMART EXTRACTION ══════════════════════════════════════════════════════
+    with st.expander("🧠 Smart Extract — Auto-Fill from PDF", expanded=True):
+        st.caption(
+            "Upload a proposal PDF and the AI engine will extract key "
+            "fields to pre-fill the form below. Review and submit."
+        )
+        scan_pdf = st.file_uploader(
+            "Drop a Proposal PDF to scan",
+            type=["pdf"],
+            key="smart_extract_pdf",
+            help="The engine will extract Title, PI, Organization, Coal Grade, Budget, and Timeline.",
+        )
+        if scan_pdf is not None and st.button("🔍 Run Smart Extraction", type="primary"):
+            with st.spinner("Analysing PDF with Smart Extraction Engine…"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(scan_pdf.getbuffer())
+                    tmp_path = tmp.name
+                try:
+                    result = smart_extract_for_form(tmp_path)
+                finally:
+                    os.unlink(tmp_path)
+
+            # Store in session state so the form picks it up
+            st.session_state["_smart_fill"] = result
+            st.session_state["_smart_pdf_name"] = scan_pdf.name
+
+            # ── Show extraction results card ─────────────────────────────
+            flags = result["confidence_flags"]
+            conf = result["confidence_score"]
+            method = result["extraction_method"]
+
+            st.success(
+                f"**Extraction complete** — {conf} fields detected  ·  Method: {method}",
+                icon="✅",
+            )
+
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                st.markdown("**Detected Fields:**")
+                for field, found in flags.items():
+                    icon = "✅" if found else "❌"
+                    st.markdown(f"{icon}  {field.replace('_', ' ').title()}")
+            with rc2:
+                st.markdown("**Extracted Values:**")
+                st.markdown(f"**Title:** {result['proposal_name'] or '—'}")
+                st.markdown(f"**PI:** {result['evaluator'] or '—'}")
+                st.markdown(f"**Organization:** {result['raw_organization']}")
+                st.markdown(f"**Coal Grade:** {result['raw_coal_grade']} → {result['coal_grade']}")
+                st.markdown(f"**Budget:** {result['raw_budget']}")
+                st.markdown(f"**Timeline:** {result['raw_timeline']}")
+
+            st.info("Fields have been pre-filled in the form below. Review and submit.", icon="⬇️")
+
+    # ── Read pre-fill values from session state (or defaults) ──────────
+    sf = st.session_state.get("_smart_fill", {})
+    _pf_name = sf.get("proposal_name", "")
+    _pf_grade = sf.get("coal_grade", "D")
+    _pf_location = sf.get("location", "")
+    _pf_evaluator = sf.get("evaluator", "")
+
+    GRADE_OPTIONS = ["A", "B", "C", "D", "E", "F", "G",
+                     "Semi-Coking", "Coking", "Washery"]
+    _pf_grade_idx = GRADE_OPTIONS.index(_pf_grade) if _pf_grade in GRADE_OPTIONS else 3
+
+    st.markdown("---")
     st.caption(
         "Fill in the coal sample evaluation form below. Data is appended "
         "to the connected Google Sheet. If a PDF is attached, it is "
@@ -750,11 +897,13 @@ if nav == "➕ New Entry":
         st.markdown("##### Proposal")
         proposal_name = st.text_input(
             "Proposal Name",
+            value=_pf_name,
             placeholder="e.g. Underground Methane Capture — Phase II",
         )
         pdf_file = st.file_uploader(
             "Attach Proposal PDF (optional)",
             type=["pdf"],
+            key="entry_pdf_upload",
             help="The PDF will be uploaded to Google Drive and linked in the record.",
         )
 
@@ -764,8 +913,8 @@ if nav == "➕ New Entry":
         with fc1:
             coal_grade = st.selectbox(
                 "Coal Grade",
-                ["A", "B", "C", "D", "E", "F", "G",
-                 "Semi-Coking", "Coking", "Washery"],
+                GRADE_OPTIONS,
+                index=_pf_grade_idx,
                 help="Indian coal grade classification.",
             )
             ash = st.number_input("Ash %", 0.0, 100.0, 15.0, step=0.1)
@@ -779,11 +928,53 @@ if nav == "➕ New Entry":
         st.markdown("##### Metadata")
         fm1, fm2 = st.columns(2)
         with fm1:
-            location = st.text_input("Location / Mine", placeholder="e.g. Jharia Coalfield")
+            location = st.text_input(
+                "Location / Mine",
+                value=_pf_location,
+                placeholder="e.g. Jharia Coalfield",
+            )
         with fm2:
-            evaluator = st.text_input("Evaluator Name", placeholder="e.g. Dr. Sharma")
+            evaluator = st.text_input(
+                "Evaluator Name",
+                value=_pf_evaluator,
+                placeholder="e.g. Dr. Sharma",
+            )
 
-        remarks = st.text_area("Remarks", placeholder="Optional notes…", height=80)
+        # ── Evaluation Scoring (replaces Remarks) ────────────────────
+        st.markdown("##### 📊 Evaluation Scoring")
+        st.caption(
+            "Rate each dimension on a 1–10 scale. "
+            "Weights: Innovation 30% · Economic 25% · Environmental 25% · Ministry 20%"
+        )
+        es1, es2 = st.columns(2)
+        with es1:
+            sc_innovation = st.slider(
+                "💡 Technical Innovation", 1, 10, 5,
+                help="Novelty of approach, use of emerging tech (AI/IoT/sensors).",
+            )
+            sc_economic = st.slider(
+                "💰 Economic Viability", 1, 10, 5,
+                help="Cost effectiveness, ROI potential, budget realism.",
+            )
+        with es2:
+            sc_environmental = st.slider(
+                "🌱 Environmental Sustainability", 1, 10, 5,
+                help="Carbon reduction, waste management, ecological impact.",
+            )
+            sc_alignment = st.slider(
+                "🏛️ Ministry Alignment", 1, 10, 5,
+                help="Alignment with Coal Ministry 2026 strategic goals.",
+            )
+
+        # ── Live score preview ────────────────────────────────────────
+        _live_score = calculate_eval_score(
+            sc_innovation, sc_economic, sc_environmental, sc_alignment,
+        )
+        _score_colour = "🟢" if _live_score >= 70 else "🟡" if _live_score >= 40 else "🔴"
+        st.markdown(
+            f"**{_score_colour} Weighted Total Score: "
+            f"`{_live_score}` / 100**"
+        )
 
         submitted = st.form_submit_button("📤 Submit Entry", type="primary")
 
@@ -817,7 +1008,10 @@ if nav == "➕ New Entry":
                 else:
                     st.error(drive_msg, icon="❌")
 
-        # ── Step 2: Append row to Google Sheet ───────────────────────
+        # ── Step 2: Calculate final score & append row ────────────────
+        total_score = calculate_eval_score(
+            sc_innovation, sc_economic, sc_environmental, sc_alignment,
+        )
         row = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Proposal Name": proposal_name or "—",
@@ -829,12 +1023,19 @@ if nav == "➕ New Entry":
             "GCV (kcal/kg)": gcv,
             "Location / Mine": location or "—",
             "Evaluator": evaluator or "—",
-            "Remarks": remarks or "—",
+            "Technical Innovation": sc_innovation,
+            "Economic Viability": sc_economic,
+            "Environmental Sustainability": sc_environmental,
+            "Ministry Alignment": sc_alignment,
+            "Total Score": total_score,
             "PDF Link": pdf_link,
         }
         with st.spinner("Submitting to Google Sheets…"):
             ok, msg = append_row(gsheets_conn, "Sheet1", EVAL_COLUMNS, row)
         if ok:
+            # Clear smart-fill state after successful submit
+            st.session_state.pop("_smart_fill", None)
+            st.session_state.pop("_smart_pdf_name", None)
             st.success("✅ Entry submitted and cached data refreshed!", icon="✅")
             st.balloons()
         else:
