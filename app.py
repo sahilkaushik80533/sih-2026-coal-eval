@@ -30,7 +30,6 @@ Data Caching Strategy
 
 from __future__ import annotations
 
-import fitz  
 import io
 import os
 import tempfile
@@ -48,6 +47,7 @@ from proposal_ranker import (
     parse_budget,
     PRIORITY_KEYWORDS,
 )
+import semantic_scorer
 
 # ── Google Drive API (for PDF uploads — no temp files) ───────────────────────
 try:
@@ -99,6 +99,7 @@ SCORE_WEIGHTS: dict[str, float] = {
     "Ministry Alignment": 0.20,
 }
 
+st.write("API Key Found:", "GEMINI_API_KEY" in st.secrets)
 
 def calculate_eval_score(
     innovation: int, economic: int, environmental: int, alignment: int,
@@ -769,10 +770,6 @@ if nav == "📋 View Records":
         display_df.insert(0, "Rank", range(1, len(display_df) + 1))
 
         # ── Styled dataframe with gradient on Total Score ────────────────
-        score_cols = [c for c in ["Total Score", "Technical Innovation",
-                                   "Economic Viability", "Environmental Sustainability",
-                                   "Ministry Alignment"] if c in display_df.columns]
-
         styled = display_df.style
         if "Total Score" in display_df.columns:
             styled = styled.background_gradient(
@@ -821,65 +818,139 @@ if nav == "➕ New Entry":
 
     _drive_folder_id = st.secrets.get("drive", {}).get("folder_id", "")
 
-    # ═══ SMART EXTRACTION ══════════════════════════════════════════════════════
-    with st.expander("🧠 Smart Extract — Auto-Fill from PDF", expanded=True):
+    # ═══ SMART EXTRACTION & AI ANALYSIS ═════════════════════════════════════════
+    with st.expander("🧠 Smart Extract & AI Scoring", expanded=True):
         st.caption(
-            "Upload a proposal PDF and the AI engine will extract key "
-            "fields to pre-fill the form below. Review and submit."
+            "Upload a proposal PDF. The engine will extract key fields "
+            "**and** the Gemini AI will score the proposal automatically."
         )
         scan_pdf = st.file_uploader(
             "Drop a Proposal PDF to scan",
             type=["pdf"],
             key="smart_extract_pdf",
-            help="The engine will extract Title, PI, Organization, Coal Grade, Budget, and Timeline.",
+            help="Extracts Title, PI, Organization, Coal Grade — then sends text to Gemini for scoring.",
         )
-        if scan_pdf is not None and st.button("🔍 Run Smart Extraction", type="primary"):
-            with st.spinner("Analysing PDF with Smart Extraction Engine…"):
+
+        if scan_pdf is not None:
+            btn_col1, btn_col2 = st.columns(2)
+            run_extract = btn_col1.button("🔍 Extract Fields", use_container_width=True)
+            run_ai = btn_col2.button("🧠 AI-Score Proposal", type="primary", use_container_width=True)
+
+            # ── Shared: write PDF to temp file for extraction engine ─────
+            _tmp_path = None
+            if run_extract or run_ai:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(scan_pdf.getbuffer())
-                    tmp_path = tmp.name
-                try:
-                    result = smart_extract_for_form(tmp_path)
-                finally:
-                    os.unlink(tmp_path)
+                    _tmp_path = tmp.name
 
-            # Store in session state so the form picks it up
-            st.session_state["_smart_fill"] = result
-            st.session_state["_smart_pdf_name"] = scan_pdf.name
+            # ── Field Extraction ─────────────────────────────────────────
+            if run_extract and _tmp_path:
+                with st.spinner("Extracting fields from PDF…"):
+                    try:
+                        result = smart_extract_for_form(_tmp_path)
+                    finally:
+                        os.unlink(_tmp_path)
+                        _tmp_path = None
 
-            # ── Show extraction results card ─────────────────────────────
-            flags = result["confidence_flags"]
-            conf = result["confidence_score"]
-            method = result["extraction_method"]
+                st.session_state["_smart_fill"] = result
+                st.session_state["_smart_pdf_name"] = scan_pdf.name
 
-            st.success(
-                f"**Extraction complete** — {conf} fields detected  ·  Method: {method}",
-                icon="✅",
-            )
+                flags = result["confidence_flags"]
+                conf = result["confidence_score"]
+                method = result["extraction_method"]
 
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                st.markdown("**Detected Fields:**")
-                for field, found in flags.items():
-                    icon = "✅" if found else "❌"
-                    st.markdown(f"{icon}  {field.replace('_', ' ').title()}")
-            with rc2:
-                st.markdown("**Extracted Values:**")
-                st.markdown(f"**Title:** {result['proposal_name'] or '—'}")
-                st.markdown(f"**PI:** {result['evaluator'] or '—'}")
-                st.markdown(f"**Organization:** {result['raw_organization']}")
-                st.markdown(f"**Coal Grade:** {result['raw_coal_grade']} → {result['coal_grade']}")
-                st.markdown(f"**Budget:** {result['raw_budget']}")
-                st.markdown(f"**Timeline:** {result['raw_timeline']}")
+                st.success(
+                    f"**Extraction complete** — {conf} fields detected  ·  Method: {method}",
+                    icon="✅",
+                )
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    st.markdown("**Detected Fields:**")
+                    for field, found in flags.items():
+                        ic = "✅" if found else "❌"
+                        st.markdown(f"{ic}  {field.replace('_', ' ').title()}")
+                with rc2:
+                    st.markdown("**Extracted Values:**")
+                    st.markdown(f"**Title:** {result['proposal_name'] or '—'}")
+                    st.markdown(f"**PI:** {result['evaluator'] or '—'}")
+                    st.markdown(f"**Organization:** {result['raw_organization']}")
+                    st.markdown(f"**Coal Grade:** {result['raw_coal_grade']} → {result['coal_grade']}")
+                    st.markdown(f"**Budget:** {result['raw_budget']}")
+                    st.markdown(f"**Timeline:** {result['raw_timeline']}")
 
-            st.info("Fields have been pre-filled in the form below. Review and submit.", icon="⬇️")
+            # ── AI Semantic Scoring ───────────────────────────────────────
+            if run_ai and _tmp_path:
+                gemini_key = st.secrets.get("gemini", {}).get("api_key", "")
+                if not gemini_key:
+                    st.error(
+                        "**Gemini API key not configured.**\n\n"
+                        "Add this to `.streamlit/secrets.toml`:\n\n"
+                        "```toml\n[gemini]\napi_key = \"your-key-here\"\n```",
+                        icon="🔑",
+                    )
+                elif not semantic_scorer.is_available():
+                    st.error(
+                        "`google-generativeai` is not installed.\n\n"
+                        "Run: `pip install google-generativeai`",
+                        icon="❌",
+                    )
+                else:
+                    with st.spinner("🧠 Gemini AI is evaluating the proposal…"):
+                        try:
+                            form_data = smart_extract_for_form(_tmp_path)
+                            st.session_state["_smart_fill"] = form_data
+                            st.session_state["_smart_pdf_name"] = scan_pdf.name
+
+                            from extraction_engine import extract_text
+                            raw_text, _ = extract_text(_tmp_path)
+
+                            ai_result = semantic_scorer.analyze_proposal(
+                                raw_text, gemini_key,
+                            )
+                            st.session_state["_ai_scores"] = ai_result
+                        except Exception as exc:
+                            st.error(f"AI analysis failed: {exc}", icon="❌")
+                            ai_result = None
+                        finally:
+                            os.unlink(_tmp_path)
+                            _tmp_path = None
+
+                    if ai_result:
+                        st.success(
+                            f"**AI Scoring complete** · Model: `{ai_result['model']}`",
+                            icon="🧠",
+                        )
+
+                        ai1, ai2, ai3, ai4 = st.columns(4)
+                        ai1.metric("💡 Innovation", f"{ai_result['technical_innovation']} / 10")
+                        ai2.metric("💰 Economic", f"{ai_result['economic_viability']} / 10")
+                        ai3.metric("🌱 Environmental", f"{ai_result['environmental_sustainability']} / 10")
+                        ai4.metric("🏛️ Ministry", f"{ai_result['ministry_alignment']} / 10")
+
+                        st.markdown("---")
+                        st.markdown("**📝 AI Reasoning:**")
+                        st.info(ai_result["reasoning"], icon="🧠")
+
+            # Clean up temp file if still around
+            if _tmp_path and os.path.exists(_tmp_path):
+                os.unlink(_tmp_path)
+
+        if st.session_state.get("_smart_fill") or st.session_state.get("_ai_scores"):
+            st.info("⬇️ Fields and/or scores have been pre-filled below. Review and submit.", icon="⬇️")
 
     # ── Read pre-fill values from session state (or defaults) ──────────
     sf = st.session_state.get("_smart_fill", {})
+    ai = st.session_state.get("_ai_scores", {})
     _pf_name = sf.get("proposal_name", "")
     _pf_grade = sf.get("coal_grade", "D")
     _pf_location = sf.get("location", "")
     _pf_evaluator = sf.get("evaluator", "")
+
+    # AI-suggested slider defaults (fall back to 5)
+    _pf_innovation = ai.get("technical_innovation", 5)
+    _pf_economic = ai.get("economic_viability", 5)
+    _pf_environmental = ai.get("environmental_sustainability", 5)
+    _pf_alignment = ai.get("ministry_alignment", 5)
 
     GRADE_OPTIONS = ["A", "B", "C", "D", "E", "F", "G",
                      "Semi-Coking", "Coking", "Washery"]
@@ -940,29 +1011,36 @@ if nav == "➕ New Entry":
                 placeholder="e.g. Dr. Sharma",
             )
 
-        # ── Evaluation Scoring (replaces Remarks) ────────────────────
+        # ── Evaluation Scoring ───────────────────────────────────────
         st.markdown("##### 📊 Evaluation Scoring")
-        st.caption(
-            "Rate each dimension on a 1–10 scale. "
-            "Weights: Innovation 30% · Economic 25% · Environmental 25% · Ministry 20%"
-        )
+        if st.session_state.get("_ai_scores"):
+            st.caption(
+                "✨ Sliders pre-filled by **Gemini AI**. "
+                "Adjust if needed before submitting. "
+                "Weights: Innovation 30% · Economic 25% · Environmental 25% · Ministry 20%"
+            )
+        else:
+            st.caption(
+                "Rate each dimension on a 1–10 scale. "
+                "Weights: Innovation 30% · Economic 25% · Environmental 25% · Ministry 20%"
+            )
         es1, es2 = st.columns(2)
         with es1:
             sc_innovation = st.slider(
-                "💡 Technical Innovation", 1, 10, 5,
+                "💡 Technical Innovation", 1, 10, _pf_innovation,
                 help="Novelty of approach, use of emerging tech (AI/IoT/sensors).",
             )
             sc_economic = st.slider(
-                "💰 Economic Viability", 1, 10, 5,
+                "💰 Economic Viability", 1, 10, _pf_economic,
                 help="Cost effectiveness, ROI potential, budget realism.",
             )
         with es2:
             sc_environmental = st.slider(
-                "🌱 Environmental Sustainability", 1, 10, 5,
+                "🌱 Environmental Sustainability", 1, 10, _pf_environmental,
                 help="Carbon reduction, waste management, ecological impact.",
             )
             sc_alignment = st.slider(
-                "🏛️ Ministry Alignment", 1, 10, 5,
+                "🏛️ Ministry Alignment", 1, 10, _pf_alignment,
                 help="Alignment with Coal Ministry 2026 strategic goals.",
             )
 
