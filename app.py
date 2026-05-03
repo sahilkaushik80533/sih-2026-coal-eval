@@ -36,6 +36,8 @@ import tempfile
 from datetime import datetime
 from typing import Any
 
+import matplotlib                       # Required by Styler.background_gradient
+import matplotlib.pyplot as plt          # noqa: F401 — ensures matplotlib is fully loaded
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -99,7 +101,135 @@ SCORE_WEIGHTS: dict[str, float] = {
     "Ministry Alignment": 0.20,
 }
 
-st.write("API Key Found:", "GEMINI_API_KEY" in st.secrets)
+# ── Gemini SDK (soft import — app works without it) ──────────────────────────
+try:
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+
+
+def _resolve_gemini_key() -> str:
+    """
+    Locate the Gemini API key from ``st.secrets``.
+
+    Supports two layouts:
+      1. ``GEMINI_API_KEY = "…"``            (top-level)
+      2. ``[gemini]\n  api_key = "…"``       (nested table)
+    Returns an empty string if neither is found.
+    """
+    # Top-level key (user-requested format)
+    key = st.secrets.get("GEMINI_API_KEY", "")
+    if key:
+        return key
+    # Nested table (legacy format)
+    key = st.secrets.get("gemini", {}).get("api_key", "")
+    return key
+
+
+def get_semantic_analysis(text: str) -> dict:
+    """
+    Call the Gemini API as a *Coal Mining Technical Expert* and return a
+    structured evaluation of the proposal text.
+
+    Returns
+    -------
+    dict
+        ``innovation_score``  (int 1–10)
+        ``feasibility_score`` (int 1–10)
+        ``technical_summary`` (str, 2 sentences)
+        ``model``             (str, model name used)
+
+    Raises
+    ------
+    RuntimeError
+        If the Gemini SDK is missing or the API key is absent.
+    """
+    import json, re  # local — already at module top but keep scope clear
+
+    if not _GENAI_AVAILABLE:
+        raise RuntimeError(
+            "`google-generativeai` is not installed.\n"
+            "Run: pip install google-generativeai"
+        )
+
+    api_key = _resolve_gemini_key()
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key not configured.  Add one of the following "
+            "to `.streamlit/secrets.toml`:\n\n"
+            '  GEMINI_API_KEY = "your-key"\n'
+            "or\n"
+            '  [gemini]\n  api_key = "your-key"'
+        )
+
+    genai.configure(api_key=api_key)
+
+    # Truncate to ~30 000 chars to stay within free-tier limits
+    cleaned = re.sub(r"\s+", " ", text).strip()[:30_000]
+    if len(cleaned) < 100:
+        raise ValueError(
+            "Extracted text is too short for meaningful analysis. "
+            "Ensure the PDF has readable content."
+        )
+
+    RUBRIC_PROMPT = """\
+You are a **Coal Mining Technical Expert** reviewing an Indian Coal R&D Proposal.
+Be rigorous, fair, and concise.
+
+Evaluate the proposal and return **only** a JSON object with this exact schema:
+
+```json
+{
+  "innovation_score": <int 1-10>,
+  "feasibility_score": <int 1-10>,
+  "technical_summary": "<exactly 2 sentences summarising the proposal's strengths and risks>"
+}
+```
+
+Scoring guidelines:
+- **innovation_score**: Novelty of approach, use of emerging tech (AI/IoT/sensors),
+  advanced materials or methods.  8+ requires strong, explicit evidence.
+- **feasibility_score**: Budget realism, timeline achievability, team capability,
+  infrastructure readiness.  8+ requires clear evidence of prior work or partnerships.
+
+Rules:
+- Return ONLY the JSON object — no markdown fences, no extra commentary.
+- If evidence is ambiguous, default to 5.
+"""
+
+    model_name = "gemini-1.5-flash"
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=RUBRIC_PROMPT,
+    )
+    response = model.generate_content(
+        f"Evaluate the following R&D proposal:\n\n{cleaned}",
+        generation_config=genai.GenerationConfig(
+            temperature=0.2,
+            max_output_tokens=512,
+        ),
+    )
+
+    raw = response.text
+    raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        raise ValueError(f"No JSON object in AI response:\n{raw[:500]}")
+    parsed = json.loads(m.group())
+
+    def _clamp(v, lo=1, hi=10):
+        try:
+            return max(lo, min(hi, int(v)))
+        except (TypeError, ValueError):
+            return 5
+
+    return {
+        "innovation_score": _clamp(parsed.get("innovation_score")),
+        "feasibility_score": _clamp(parsed.get("feasibility_score")),
+        "technical_summary": str(parsed.get("technical_summary", "No summary provided.")),
+        "model": model_name,
+    }
 
 def calculate_eval_score(
     innovation: int, economic: int, environmental: int, alignment: int,
@@ -769,7 +899,7 @@ if nav == "📋 View Records":
         display_df = display_df.copy()
         display_df.insert(0, "Rank", range(1, len(display_df) + 1))
 
-        # ── Styled dataframe with gradient on Total Score ────────────────
+        # ── Styled dataframe with gradient on Total Score & Innovation ───
         styled = display_df.style
         if "Total Score" in display_df.columns:
             styled = styled.background_gradient(
@@ -777,6 +907,13 @@ if nav == "📋 View Records":
                 cmap="RdYlGn",
                 vmin=0,
                 vmax=100,
+            )
+        if "Technical Innovation" in display_df.columns:
+            styled = styled.background_gradient(
+                subset=["Technical Innovation"],
+                cmap="YlOrRd",
+                vmin=1,
+                vmax=10,
             )
 
         st.dataframe(
@@ -878,14 +1015,14 @@ if nav == "➕ New Entry":
                     st.markdown(f"**Budget:** {result['raw_budget']}")
                     st.markdown(f"**Timeline:** {result['raw_timeline']}")
 
-            # ── AI Semantic Scoring ───────────────────────────────────────
+            # ── AI Semantic Scoring (existing 4-axis scorer) ─────────────
             if run_ai and _tmp_path:
-                gemini_key = st.secrets.get("gemini", {}).get("api_key", "")
+                gemini_key = _resolve_gemini_key()
                 if not gemini_key:
                     st.error(
                         "**Gemini API key not configured.**\n\n"
                         "Add this to `.streamlit/secrets.toml`:\n\n"
-                        "```toml\n[gemini]\napi_key = \"your-key-here\"\n```",
+                        '```toml\nGEMINI_API_KEY = "your-key-here"\n```',
                         icon="🔑",
                     )
                 elif not semantic_scorer.is_available():
@@ -937,6 +1074,119 @@ if nav == "➕ New Entry":
 
         if st.session_state.get("_smart_fill") or st.session_state.get("_ai_scores"):
             st.info("⬇️ Fields and/or scores have been pre-filled below. Review and submit.", icon="⬇️")
+
+    # ═══ 🧠 AI TECHNICAL AUDIT — SEMANTIC ANALYSIS ═══════════════════════════
+    with st.expander("🧠 AI Technical Audit", expanded=False):
+        st.caption(
+            "Run a **Semantic Analysis** on the uploaded PDF.  The Gemini AI "
+            "will act as a Coal Mining Technical Expert and return an "
+            "Innovation Score, Feasibility Score, and a 2-sentence summary.  "
+            "Scores are auto-filled into the evaluation sliders below."
+        )
+
+        # The audit needs a PDF — reuse the same uploader from Smart Extract
+        _audit_pdf = st.session_state.get("smart_extract_pdf")
+        if _audit_pdf is None:
+            st.info(
+                "⬆️ Upload a PDF in the **Smart Extract & AI Scoring** panel "
+                "above first, then click the button below.",
+                icon="📄",
+            )
+
+        run_semantic = st.button(
+            "🔍 Run Semantic Analysis",
+            type="primary",
+            use_container_width=True,
+            disabled=(_audit_pdf is None),
+            key="run_semantic_btn",
+        )
+
+        if run_semantic and _audit_pdf is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(_audit_pdf.getbuffer())
+                _sem_path = tmp.name
+            try:
+                with st.spinner("🧠 Running Semantic Analysis via Gemini…"):
+                    from extraction_engine import extract_text
+                    raw_text, _ = extract_text(_sem_path)
+                    sem_result = get_semantic_analysis(raw_text)
+                    st.session_state["_semantic_result"] = sem_result
+            except Exception as exc:
+                st.error(f"Semantic Analysis failed: {exc}", icon="❌")
+            finally:
+                if os.path.exists(_sem_path):
+                    os.unlink(_sem_path)
+
+        # ── Display results & auto-fill ──────────────────────────────────
+        sem = st.session_state.get("_semantic_result")
+        if sem:
+            # Map semantic scores → evaluation sliders
+            st.session_state.setdefault("_ai_scores", {})
+            st.session_state["_ai_scores"]["technical_innovation"] = sem["innovation_score"]
+            st.session_state["_ai_scores"]["economic_viability"] = sem["feasibility_score"]
+
+            # ── Confidence Card ──────────────────────────────────────
+            inn = sem["innovation_score"]
+            feas = sem["feasibility_score"]
+            avg = round((inn + feas) / 2, 1)
+
+            # Colour coding
+            if avg >= 7:
+                card_border = "#43a047"
+                card_bg = "rgba(67,160,71,0.08)"
+                verdict = "🟢 High Confidence"
+            elif avg >= 4:
+                card_border = "#fb8c00"
+                card_bg = "rgba(251,140,0,0.08)"
+                verdict = "🟡 Moderate Confidence"
+            else:
+                card_border = "#e53935"
+                card_bg = "rgba(229,57,53,0.08)"
+                verdict = "🔴 Low Confidence"
+
+            st.markdown(
+                f"""
+                <div style="
+                    background: {card_bg};
+                    border-left: 5px solid {card_border};
+                    border-radius: 10px;
+                    padding: 1.2rem 1.5rem;
+                    margin: 1rem 0;
+                ">
+                    <h4 style="margin:0 0 .6rem 0; color:#fff;">
+                        🧠 Semantic Confidence Card &nbsp;·&nbsp; {verdict}
+                    </h4>
+                    <table style="width:100%; color:#e8eaf6; font-size:.95rem;">
+                        <tr>
+                            <td><strong>💡 Innovation Score</strong></td>
+                            <td style="text-align:right; font-weight:700; font-size:1.2rem;">
+                                {inn} / 10
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>⚙️ Feasibility Score</strong></td>
+                            <td style="text-align:right; font-weight:700; font-size:1.2rem;">
+                                {feas} / 10
+                            </td>
+                        </tr>
+                    </table>
+                    <hr style="border-color:rgba(255,255,255,0.1); margin:.8rem 0;">
+                    <p style="margin:0; color:#cfd8dc; font-size:.92rem;">
+                        📝 <em>{sem['technical_summary']}</em>
+                    </p>
+                    <p style="margin:.5rem 0 0 0; color:#90a4ae; font-size:.8rem;">
+                        Model: <code>{sem['model']}</code>
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.success(
+                "✨ Innovation and Feasibility scores have been auto-filled "
+                "into the evaluation sliders below.",
+                icon="⬇️",
+            )
 
     # ── Read pre-fill values from session state (or defaults) ──────────
     sf = st.session_state.get("_smart_fill", {})
