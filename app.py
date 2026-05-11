@@ -127,16 +127,29 @@ def _resolve_gemini_key() -> str:
     return key
 
 
+# ── Safety settings — BLOCK_NONE to avoid false flags on mining terms ────────
+_GEMINI_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT",         "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",        "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_NONE"},
+]
+
+
 def get_semantic_analysis(text: str) -> dict:
     """
-    Call the Gemini API as a *Coal Mining Technical Expert* and return a
-    structured evaluation of the proposal text.
+    Call the Gemini API as a *Ministry of Coal Technical Auditor* and return
+    a structured evaluation of the proposal text.
+
+    Uses ``gemini-1.5-pro`` with all safety categories set to ``BLOCK_NONE``
+    to prevent false flags on coal-mining terminology.
 
     Returns
     -------
     dict
         ``innovation_score``  (int 1–10)
         ``feasibility_score`` (int 1–10)
+        ``impact_score``      (int 1–10)
         ``technical_summary`` (str, 2 sentences)
         ``model``             (str, model name used)
 
@@ -174,34 +187,43 @@ def get_semantic_analysis(text: str) -> dict:
         )
 
     RUBRIC_PROMPT = """\
-You are a **Coal Mining Technical Expert** reviewing an Indian Coal R&D Proposal.
-Be rigorous, fair, and concise.
+You are a **Ministry of Coal — Technical Auditor** reviewing an Indian Coal R&D
+Proposal.  Be rigorous, fair, and concise.
 
-Evaluate the proposal and return **only** a JSON object with this exact schema:
+Evaluate the proposal and return ONLY a raw JSON object (no markdown fences,
+no backticks, no extra text) with this exact schema:
 
-```json
 {
   "innovation_score": <int 1-10>,
   "feasibility_score": <int 1-10>,
-  "technical_summary": "<exactly 2 sentences summarising the proposal's strengths and risks>"
+  "impact_score": <int 1-10>,
+  "technical_summary": "<exactly 2 sentences summarising strengths and risks>"
 }
-```
 
 Scoring guidelines:
-- **innovation_score**: Novelty of approach, use of emerging tech (AI/IoT/sensors),
-  advanced materials or methods.  8+ requires strong, explicit evidence.
-- **feasibility_score**: Budget realism, timeline achievability, team capability,
-  infrastructure readiness.  8+ requires clear evidence of prior work or partnerships.
+- **innovation_score**: Novelty of approach, use of emerging tech (AI/IoT/
+  drones/sensors), advanced materials or methods.  8+ requires strong,
+  explicit evidence of breakthrough innovation.
+- **feasibility_score**: Budget realism, timeline achievability, team
+  capability, infrastructure readiness.  8+ requires clear evidence of
+  prior results or institutional partnerships.
+- **impact_score**: Potential impact on coal sector efficiency, safety,
+  environmental sustainability, carbon reduction, or alignment with
+  Ministry of Coal 2026 strategic priorities (Coal Gasification, Blue
+  Hydrogen, Mine Safety, Carbon Capture, Pit Lake Management).  8+ requires
+  quantified impact projections or strong policy alignment.
 
 Rules:
-- Return ONLY the JSON object — no markdown fences, no extra commentary.
+- Return ONLY the raw JSON object — no markdown fences, no extra commentary.
 - If evidence is ambiguous, default to 5.
+- Be strict: 8+ requires strong, explicit evidence.
 """
 
-    model_name = "gemini-1.5-flash"
+    model_name = "gemini-1.5-pro"
     model = genai.GenerativeModel(
         model_name=model_name,
         system_instruction=RUBRIC_PROMPT,
+        safety_settings=_GEMINI_SAFETY_SETTINGS,
     )
     response = model.generate_content(
         f"Evaluate the following R&D proposal:\n\n{cleaned}",
@@ -227,6 +249,7 @@ Rules:
     return {
         "innovation_score": _clamp(parsed.get("innovation_score")),
         "feasibility_score": _clamp(parsed.get("feasibility_score")),
+        "impact_score": _clamp(parsed.get("impact_score")),
         "technical_summary": str(parsed.get("technical_summary", "No summary provided.")),
         "model": model_name,
     }
@@ -1079,8 +1102,9 @@ if nav == "➕ New Entry":
     with st.expander("🧠 AI Technical Audit", expanded=False):
         st.caption(
             "Run a **Semantic Analysis** on the uploaded PDF.  The Gemini AI "
-            "will act as a Coal Mining Technical Expert and return an "
-            "Innovation Score, Feasibility Score, and a 2-sentence summary.  "
+            "will act as a **Ministry of Coal Technical Auditor** and return "
+            "Innovation, Feasibility, and Impact scores (1–10) plus a "
+            "2-sentence technical summary.  "
             "Scores are auto-filled into the evaluation sliders below."
         )
 
@@ -1094,7 +1118,7 @@ if nav == "➕ New Entry":
             )
 
         run_semantic = st.button(
-            "🔍 Run Semantic Analysis",
+            "🔍 Run AI Semantic Audit",
             type="primary",
             use_container_width=True,
             disabled=(_audit_pdf is None),
@@ -1106,13 +1130,13 @@ if nav == "➕ New Entry":
                 tmp.write(_audit_pdf.getbuffer())
                 _sem_path = tmp.name
             try:
-                with st.spinner("🧠 Running Semantic Analysis via Gemini…"):
+                with st.spinner("🧠 Gemini 1.5 Pro is auditing the proposal…"):
                     from extraction_engine import extract_text
                     raw_text, _ = extract_text(_sem_path)
                     sem_result = get_semantic_analysis(raw_text)
                     st.session_state["_semantic_result"] = sem_result
             except Exception as exc:
-                st.error(f"Semantic Analysis failed: {exc}", icon="❌")
+                st.error(f"AI Semantic Audit failed: {exc}", icon="❌")
             finally:
                 if os.path.exists(_sem_path):
                     os.unlink(_sem_path)
@@ -1124,11 +1148,13 @@ if nav == "➕ New Entry":
             st.session_state.setdefault("_ai_scores", {})
             st.session_state["_ai_scores"]["technical_innovation"] = sem["innovation_score"]
             st.session_state["_ai_scores"]["economic_viability"] = sem["feasibility_score"]
+            st.session_state["_ai_scores"]["environmental_sustainability"] = sem["impact_score"]
 
             # ── Confidence Card ──────────────────────────────────────
             inn = sem["innovation_score"]
             feas = sem["feasibility_score"]
-            avg = round((inn + feas) / 2, 1)
+            imp = sem["impact_score"]
+            avg = round((inn + feas + imp) / 3, 1)
 
             # Colour coding
             if avg >= 7:
@@ -1154,7 +1180,7 @@ if nav == "➕ New Entry":
                     margin: 1rem 0;
                 ">
                     <h4 style="margin:0 0 .6rem 0; color:#fff;">
-                        🧠 Semantic Confidence Card &nbsp;·&nbsp; {verdict}
+                        🧠 Semantic Audit Card &nbsp;·&nbsp; {verdict}
                     </h4>
                     <table style="width:100%; color:#e8eaf6; font-size:.95rem;">
                         <tr>
@@ -1167,6 +1193,12 @@ if nav == "➕ New Entry":
                             <td><strong>⚙️ Feasibility Score</strong></td>
                             <td style="text-align:right; font-weight:700; font-size:1.2rem;">
                                 {feas} / 10
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>🌍 Impact Score</strong></td>
+                            <td style="text-align:right; font-weight:700; font-size:1.2rem;">
+                                {imp} / 10
                             </td>
                         </tr>
                     </table>
@@ -1183,8 +1215,8 @@ if nav == "➕ New Entry":
             )
 
             st.success(
-                "✨ Innovation and Feasibility scores have been auto-filled "
-                "into the evaluation sliders below.",
+                "✨ Innovation, Feasibility, and Impact scores have been "
+                "auto-filled into the evaluation sliders below.",
                 icon="⬇️",
             )
 

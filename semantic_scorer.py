@@ -13,7 +13,7 @@ Dependencies
 
 Configuration
 -------------
-The API key is read from ``st.secrets["gemini"]["api_key"]`` at call time.
+The API key is read from ``st.secrets["GEMINI_API_KEY"]`` at call time.
 """
 
 from __future__ import annotations
@@ -33,43 +33,60 @@ except ImportError:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-#: Maximum characters of proposal text to send.  Gemini 1.5 Flash supports
-#: up to ~1 M tokens, but we cap at 30 000 chars (~8 000 tokens) to stay
+#: Maximum characters of proposal text to send.  Gemini 1.5 Pro supports
+#: up to ~2 M tokens, but we cap at 30 000 chars (~8 000 tokens) to stay
 #: well within free-tier limits and keep latency low.
 MAX_TEXT_CHARS = 30_000
 
-#: The system prompt that turns Gemini into a Ministry of Coal auditor.
+#: Model name — upgraded to gemini-1.5-pro for deeper reasoning.
+MODEL_NAME = "gemini-1.5-pro"
+
+#: Safety settings — set all categories to BLOCK_NONE.
+#: Coal mining terminology (explosives, blasting, hazardous gases, etc.)
+#: triggers false positives on default safety filters.
+SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT",         "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",        "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_NONE"},
+]
+
+#: The system prompt that turns Gemini into a Ministry of Coal Technical Auditor.
 SYSTEM_PROMPT = """\
-You are a **Ministry of Coal – Technical Auditor**.  Your job is to evaluate
-an R&D proposal for the Indian Coal sector.  Be rigorous, fair, and concise.
+You are a **Ministry of Coal — Technical Auditor**.  Your job is to evaluate
+an R&D proposal submitted for the Indian Coal sector.  Be rigorous, fair,
+and concise.
 
-Evaluate the proposal on **exactly four** dimensions, each on a 1–10 scale:
+Evaluate the proposal on **exactly three** dimensions, each on a 1–10 scale:
 
-1. **Technical Innovation** — Is the science sound?  Does it use novel
-   methods, emerging tech (AI / IoT / sensors), or advanced materials?
-2. **Economic Viability** — Is the budget realistic?  What is the potential
-   ROI?  Will it attract industry co-investment?
-3. **Environmental Sustainability** — Does it reduce carbon emissions,
-   improve waste management, or protect ecosystems?
-4. **Ministry Alignment** — Does it address a 2026 Ministry of Coal
-   strategic priority (e.g. Coal Gasification, Blue Hydrogen, Mine Safety,
-   Carbon Capture, Pit Lake Management)?
+1. **innovation_score** — Novelty of approach, use of emerging technologies
+   (AI / IoT / drones / sensors), advanced materials, or novel methods.
+   8+ requires strong, explicit evidence of breakthrough innovation.
+2. **feasibility_score** — Budget realism, timeline achievability, team
+   capability, infrastructure readiness, and prior pilot work.
+   8+ requires clear evidence of prior results or institutional partnerships.
+3. **impact_score** — Potential impact on coal sector efficiency, safety,
+   environmental sustainability, carbon reduction, or alignment with
+   Ministry of Coal 2026 strategic priorities (e.g. Coal Gasification,
+   Blue Hydrogen, Mine Safety, Carbon Capture, Pit Lake Management).
+   8+ requires quantified impact projections or strong policy alignment.
 
-Return your response **only** as a JSON object in this exact schema:
+Also provide a **technical_summary**: exactly 2 sentences summarising the
+proposal's core strengths and primary risks.
 
-```json
+Return your response **only** as a raw JSON object with this exact schema:
+
 {
-  "technical_innovation": <int 1-10>,
-  "economic_viability": <int 1-10>,
-  "environmental_sustainability": <int 1-10>,
-  "ministry_alignment": <int 1-10>,
-  "reasoning": "<2-4 sentence summary explaining the scores>"
+  "innovation_score": <int 1-10>,
+  "feasibility_score": <int 1-10>,
+  "impact_score": <int 1-10>,
+  "technical_summary": "<exactly 2 sentences>"
 }
-```
 
 Rules:
-- Return ONLY the JSON object.  No markdown fences, no extra text.
-- Choose a score of 5 if the evidence is unclear.
+- Return ONLY the raw JSON object.  No markdown fences, no backticks, no
+  extra text before or after the JSON.
+- Choose a score of 5 if the evidence is unclear or ambiguous.
 - Be strict: a score of 8+ requires strong, explicit evidence in the text.
 """
 
@@ -120,7 +137,7 @@ def analyze_proposal(
     text: str,
     api_key: str,
     *,
-    model_name: str = "gemini-1.5-flash",
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """
     Send *text* to Gemini and return structured scores.
@@ -131,15 +148,14 @@ def analyze_proposal(
         Full proposal text (will be cleaned and truncated).
     api_key : str
         Google Gemini API key.
-    model_name : str
-        Model to use (default: ``gemini-1.5-flash``).
+    model_name : str, optional
+        Model to use.  Defaults to ``MODEL_NAME`` (``gemini-1.5-pro``).
 
     Returns
     -------
     dict
-        Keys: ``technical_innovation``, ``economic_viability``,
-        ``environmental_sustainability``, ``ministry_alignment`` (int 1–10),
-        ``reasoning`` (str), ``model`` (str).
+        Keys: ``innovation_score``, ``feasibility_score``, ``impact_score``
+        (int 1–10), ``technical_summary`` (str), ``model`` (str).
 
     Raises
     ------
@@ -152,6 +168,8 @@ def analyze_proposal(
             "Run: pip install google-generativeai"
         )
 
+    _model = model_name or MODEL_NAME
+
     genai.configure(api_key=api_key)
 
     cleaned = _clean_and_truncate(text)
@@ -162,8 +180,9 @@ def analyze_proposal(
         )
 
     model = genai.GenerativeModel(
-        model_name=model_name,
+        model_name=_model,
         system_instruction=SYSTEM_PROMPT,
+        safety_settings=SAFETY_SETTINGS,
     )
 
     response = model.generate_content(
@@ -178,10 +197,11 @@ def analyze_proposal(
     parsed = _extract_json(raw_text)
 
     return {
-        "technical_innovation": _clamp(parsed.get("technical_innovation")),
-        "economic_viability": _clamp(parsed.get("economic_viability")),
-        "environmental_sustainability": _clamp(parsed.get("environmental_sustainability")),
-        "ministry_alignment": _clamp(parsed.get("ministry_alignment")),
-        "reasoning": str(parsed.get("reasoning", "No reasoning provided.")),
-        "model": model_name,
+        "innovation_score": _clamp(parsed.get("innovation_score")),
+        "feasibility_score": _clamp(parsed.get("feasibility_score")),
+        "impact_score": _clamp(parsed.get("impact_score")),
+        "technical_summary": str(
+            parsed.get("technical_summary", "No summary provided.")
+        ),
+        "model": _model,
     }
