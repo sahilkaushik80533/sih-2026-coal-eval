@@ -103,7 +103,8 @@ SCORE_WEIGHTS: dict[str, float] = {
 
 # ── Gemini SDK (soft import — app works without it) ──────────────────────────
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
@@ -128,12 +129,7 @@ def _resolve_gemini_key() -> str:
 
 
 # ── Safety settings — BLOCK_NONE to avoid false flags on mining terms ────────
-_GEMINI_SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HARASSMENT",         "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH",        "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_NONE"},
-]
+# Now constructed as google.genai types.SafetySetting objects at call time.
 
 
 def get_semantic_analysis(text: str) -> dict:
@@ -141,8 +137,9 @@ def get_semantic_analysis(text: str) -> dict:
     Call the Gemini API as a *Ministry of Coal Technical Auditor* and return
     a structured evaluation of the proposal text.
 
-    Uses ``gemini-1.5-pro-latest`` with all safety categories set to ``BLOCK_NONE``
-    to prevent false flags on coal-mining terminology.
+    Uses ``gemini-1.5-pro-latest`` via the new ``google.genai`` Client SDK
+    with all safety categories set to ``BLOCK_NONE`` to prevent false flags
+    on coal-mining terminology.
 
     Returns
     -------
@@ -162,8 +159,8 @@ def get_semantic_analysis(text: str) -> dict:
 
     if not _GENAI_AVAILABLE:
         raise RuntimeError(
-            "`google-generativeai` is not installed.\n"
-            "Run: pip install google-generativeai"
+            "`google-genai` is not installed.\n"
+            "Run: pip install google-genai"
         )
 
     api_key = _resolve_gemini_key()
@@ -175,8 +172,6 @@ def get_semantic_analysis(text: str) -> dict:
             "or\n"
             '  [gemini]\n  api_key = "your-key"'
         )
-
-    genai.configure(api_key=api_key)
 
     # Truncate to ~30 000 chars to stay within free-tier limits
     cleaned = re.sub(r"\s+", " ", text).strip()[:30_000]
@@ -220,16 +215,32 @@ Rules:
 """
 
     model_name = "gemini-1.5-pro-latest"
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=RUBRIC_PROMPT,
-        safety_settings=_GEMINI_SAFETY_SETTINGS,
-    )
-    response = model.generate_content(
-        f"Evaluate the following R&D proposal:\n\n{cleaned}",
-        generation_config=genai.GenerationConfig(
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=f"Evaluate the following R&D proposal:\n\n{cleaned}",
+        config=genai_types.GenerateContentConfig(
+            system_instruction=RUBRIC_PROMPT,
             temperature=0.2,
             max_output_tokens=512,
+            safety_settings=[
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="BLOCK_NONE",
+                ),
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH",
+                    threshold="BLOCK_NONE",
+                ),
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="BLOCK_NONE",
+                ),
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_NONE",
+                ),
+            ],
         ),
     )
 
@@ -769,10 +780,10 @@ def render_proposal_card(scored: dict[str, Any]) -> None:
         st.markdown(f"**Priority Keywords Matched:** {kw_str}")
     with col_chart:
         st.markdown("##### Score Breakdown")
-        st.plotly_chart(score_breakdown_chart(scored), use_container_width=True)
+        st.plotly_chart(score_breakdown_chart(scored), width="stretch")
 
     with st.expander("📊 Detailed Scoring Analytics"):
-        st.plotly_chart(radar_chart(scored), use_container_width=True)
+        st.plotly_chart(radar_chart(scored), width="stretch")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -922,6 +933,11 @@ if nav == "📋 View Records":
         display_df = display_df.copy()
         display_df.insert(0, "Rank", range(1, len(display_df) + 1))
 
+        # ── PyArrow fix: coerce mixed-type columns to str ────────────────
+        _pyarrow_col = "LIST OF ONGOING S&T PROJECTS (As on 15.02.2026)"
+        if _pyarrow_col in display_df.columns:
+            display_df[_pyarrow_col] = display_df[_pyarrow_col].astype(str)
+
         # ── Styled dataframe with gradient on Total Score & Innovation ───
         styled = display_df.style
         if "Total Score" in display_df.columns:
@@ -941,7 +957,7 @@ if nav == "📋 View Records":
 
         st.dataframe(
             styled,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Rank": st.column_config.NumberColumn(width="small"),
@@ -1616,7 +1632,7 @@ with tab_dash:
     ])
 
     st.dataframe(
-        df, use_container_width=True, hide_index=True,
+        df, width="stretch", hide_index=True,
         column_config={
             "Rank": st.column_config.NumberColumn(width="small"),
             "Total Score": st.column_config.NumberColumn(format="%.1f"),
@@ -1693,7 +1709,7 @@ with tab_analytics:
             )
             st.plotly_chart(
                 radar_chart(scored, height=350),
-                use_container_width=True,
+                width="stretch",
                 key=f"radar_{idx}",
             )
             st.markdown("---")
@@ -1741,18 +1757,18 @@ with tab_compare:
                     b["timeline_score"], f"+{b['pi_bonus']}", b["total_score"],
                 ],
             })
-            st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+            st.dataframe(cmp_df, width="stretch", hide_index=True)
 
             st.markdown("#### Score Breakdown")
             ch1, ch2 = st.columns(2)
             with ch1:
                 st.markdown(f"**{pick_a}**")
                 st.plotly_chart(score_breakdown_chart(a, height=250),
-                               use_container_width=True, key="cmp_chart_a")
+                               width="stretch", key="cmp_chart_a")
             with ch2:
                 st.markdown(f"**{pick_b}**")
                 st.plotly_chart(score_breakdown_chart(b, height=250),
-                               use_container_width=True, key="cmp_chart_b")
+                               width="stretch", key="cmp_chart_b")
 
             # ── Radar overlay comparison ─────────────────────────────────
             st.markdown("#### Radar Comparison")
@@ -1786,7 +1802,7 @@ with tab_compare:
                 legend=dict(x=0.5, y=-0.15, xanchor="center",
                             orientation="h"),
             )
-            st.plotly_chart(overlay_fig, use_container_width=True,
+            st.plotly_chart(overlay_fig, width="stretch",
                            key="cmp_radar_overlay")
 
             diff = round(a["total_score"] - b["total_score"], 1)

@@ -3,13 +3,13 @@ semantic_scorer.py
 ==================
 AI-driven Semantic Scoring Engine for Coal R&D Proposals.
 
-Uses the **Google Gemini API** (``google-generativeai``) to evaluate proposal
+Uses the **Google Gemini API** (``google-genai``) to evaluate proposal
 text against a strict Ministry of Coal rubric and return structured JSON
 scores that can auto-populate the evaluation form.
 
 Dependencies
 ------------
-- ``google-generativeai >= 0.5.0``   (pip install google-generativeai)
+- ``google-genai >= 1.0.0``   (pip install google-genai)
 
 Configuration
 -------------
@@ -24,7 +24,8 @@ from typing import Any
 
 # ── Soft import — the app still works without the Gemini SDK ─────────────────
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
 
     _GEMINI_AVAILABLE = True
 except ImportError:
@@ -47,12 +48,26 @@ FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-pro"]
 #: Safety settings — set all categories to BLOCK_NONE.
 #: Coal mining terminology (explosives, blasting, hazardous gases, etc.)
 #: triggers false positives on default safety filters.
-SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HARASSMENT",         "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH",        "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_NONE"},
-]
+#: Built as google.genai types.SafetySetting objects.
+SAFETY_SETTINGS = None  # Constructed lazily; see _build_safety_settings()
+
+
+def _build_safety_settings() -> list:
+    """Return a list of ``genai_types.SafetySetting`` with BLOCK_NONE."""
+    return [
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE",
+        ),
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE",
+        ),
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE",
+        ),
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE",
+        ),
+    ]
 
 #: The system prompt that turns Gemini into a Ministry of Coal Technical Auditor.
 SYSTEM_PROMPT = """\
@@ -152,7 +167,7 @@ def analyze_proposal(
     api_key : str
         Google Gemini API key.
     model_name : str, optional
-        Model to use.  Defaults to ``MODEL_NAME`` (``gemini-1.5-pro``).
+        Model to use.  Defaults to ``MODEL_NAME`` (``gemini-1.5-pro-latest``).
 
     Returns
     -------
@@ -167,13 +182,13 @@ def analyze_proposal(
     """
     if not _GEMINI_AVAILABLE:
         raise RuntimeError(
-            "`google-generativeai` is not installed.\n"
-            "Run: pip install google-generativeai"
+            "`google-genai` is not installed.\n"
+            "Run: pip install google-genai"
         )
 
     _model = model_name or MODEL_NAME
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
     cleaned = _clean_and_truncate(text)
     if len(cleaned) < 100:
@@ -191,16 +206,14 @@ def analyze_proposal(
 
     for candidate in models_to_try:
         try:
-            model = genai.GenerativeModel(
-                model_name=candidate,
-                system_instruction=SYSTEM_PROMPT,
-                safety_settings=SAFETY_SETTINGS,
-            )
-            response = model.generate_content(
-                f"Evaluate the following R&D proposal:\n\n{cleaned}",
-                generation_config=genai.GenerationConfig(
+            response = client.models.generate_content(
+                model=candidate,
+                contents=f"Evaluate the following R&D proposal:\n\n{cleaned}",
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
                     temperature=0.2,       # low creativity → consistent scores
                     max_output_tokens=512, # JSON should be tiny
+                    safety_settings=_build_safety_settings(),
                 ),
             )
             raw_text = response.text
