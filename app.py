@@ -141,7 +141,7 @@ def get_semantic_analysis(text: str) -> dict:
     Call the Gemini API as a *Ministry of Coal Technical Auditor* and return
     a structured evaluation of the proposal text.
 
-    Uses ``gemini-1.5-pro`` with all safety categories set to ``BLOCK_NONE``
+    Uses ``gemini-1.5-pro-latest`` with all safety categories set to ``BLOCK_NONE``
     to prevent false flags on coal-mining terminology.
 
     Returns
@@ -219,7 +219,7 @@ Rules:
 - Be strict: 8+ requires strong, explicit evidence.
 """
 
-    model_name = "gemini-1.5-pro"
+    model_name = "gemini-1.5-pro-latest"
     model = genai.GenerativeModel(
         model_name=model_name,
         system_instruction=RUBRIC_PROMPT,
@@ -1135,8 +1135,41 @@ if nav == "➕ New Entry":
                     raw_text, _ = extract_text(_sem_path)
                     sem_result = get_semantic_analysis(raw_text)
                     st.session_state["_semantic_result"] = sem_result
+            except (RuntimeError, ValueError) as exc:
+                # Config / validation errors (missing API key, short text, etc.)
+                st.error(
+                    f"**Semantic Audit configuration error:** {exc}",
+                    icon="🔑",
+                )
             except Exception as exc:
-                st.error(f"AI Semantic Audit failed: {exc}", icon="❌")
+                # Gemini API or network errors — show a user-friendly message
+                err_msg = str(exc)
+                if "404" in err_msg or "not found" in err_msg.lower():
+                    st.error(
+                        "**Gemini API model not found (404).** "
+                        "The requested model may have been deprecated.\n\n"
+                        f"Details: `{err_msg}`",
+                        icon="❌",
+                    )
+                elif "403" in err_msg or "permission" in err_msg.lower():
+                    st.error(
+                        "**Gemini API permission denied (403).** "
+                        "Check that your API key is valid and has access.\n\n"
+                        f"Details: `{err_msg}`",
+                        icon="🔒",
+                    )
+                elif "429" in err_msg or "quota" in err_msg.lower():
+                    st.error(
+                        "**Gemini API rate limit / quota exceeded.** "
+                        "Wait a moment and try again, or upgrade your API plan.\n\n"
+                        f"Details: `{err_msg}`",
+                        icon="⏳",
+                    )
+                else:
+                    st.error(
+                        f"**AI Semantic Audit failed:** {err_msg}",
+                        icon="❌",
+                    )
             finally:
                 if os.path.exists(_sem_path):
                     os.unlink(_sem_path)

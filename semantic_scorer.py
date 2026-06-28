@@ -38,8 +38,11 @@ except ImportError:
 #: well within free-tier limits and keep latency low.
 MAX_TEXT_CHARS = 30_000
 
-#: Model name — upgraded to gemini-1.5-pro for deeper reasoning.
-MODEL_NAME = "gemini-1.5-pro"
+#: Model name — use the `-latest` alias to avoid 404 on deprecated endpoints.
+MODEL_NAME = "gemini-1.5-pro-latest"
+
+#: Fallback models to try if the primary model returns a 404.
+FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-pro"]
 
 #: Safety settings — set all categories to BLOCK_NONE.
 #: Coal mining terminology (explosives, blasting, hazardous gases, etc.)
@@ -179,21 +182,47 @@ def analyze_proposal(
             "Ensure the PDF has readable content."
         )
 
-    model = genai.GenerativeModel(
-        model_name=_model,
-        system_instruction=SYSTEM_PROMPT,
-        safety_settings=SAFETY_SETTINGS,
-    )
+    # Build the ordered list of models to attempt
+    models_to_try = [_model] + [m for m in FALLBACK_MODELS if m != _model]
 
-    response = model.generate_content(
-        f"Evaluate the following R&D proposal:\n\n{cleaned}",
-        generation_config=genai.GenerationConfig(
-            temperature=0.2,       # low creativity → consistent scores
-            max_output_tokens=512, # JSON should be tiny
-        ),
-    )
+    last_error = None
+    used_model = _model
+    raw_text = None
 
-    raw_text = response.text
+    for candidate in models_to_try:
+        try:
+            model = genai.GenerativeModel(
+                model_name=candidate,
+                system_instruction=SYSTEM_PROMPT,
+                safety_settings=SAFETY_SETTINGS,
+            )
+            response = model.generate_content(
+                f"Evaluate the following R&D proposal:\n\n{cleaned}",
+                generation_config=genai.GenerationConfig(
+                    temperature=0.2,       # low creativity → consistent scores
+                    max_output_tokens=512, # JSON should be tiny
+                ),
+            )
+            raw_text = response.text
+            used_model = candidate
+            break  # success — stop trying
+        except Exception as exc:
+            last_error = exc
+            err_str = str(exc).lower()
+            # Retry with next model only on 404 / "not found" errors
+            if "404" in err_str or "not found" in err_str:
+                continue
+            # Any other error — don't retry, raise immediately
+            raise RuntimeError(
+                f"Gemini API error (model: {candidate}): {exc}"
+            ) from exc
+
+    if raw_text is None:
+        raise RuntimeError(
+            f"All Gemini models failed. Last error: {last_error}\n"
+            f"Models attempted: {models_to_try}"
+        )
+
     parsed = _extract_json(raw_text)
 
     return {
@@ -203,5 +232,5 @@ def analyze_proposal(
         "technical_summary": str(
             parsed.get("technical_summary", "No summary provided.")
         ),
-        "model": _model,
+        "model": used_model,
     }
