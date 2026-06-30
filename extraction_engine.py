@@ -4,11 +4,8 @@ extraction_engine.py
 ====================
 High-precision PDF Information Extraction (IE) module for research proposals.
 
-Supports **two extraction paths**:
-  1. **Digital PDF** — native text via PyMuPDF (primary).
-  2. **Scanned PDF / OCR fallback** — if the digital text layer has < 100
-     characters, the engine automatically converts each page to a 300 DPI
-     image and runs Tesseract OCR.
+Uses **digital text extraction only** via PyMuPDF.  If no readable text is
+found, a clean default string is returned instead of empty/null values.
 
 Usage
 -----
@@ -24,15 +21,6 @@ Outputs
 Dependencies
 ------------
 - PyMuPDF (fitz)
-- pytesseract  (requires **Tesseract-OCR** installed on the system PATH)
-- pdf2image    (requires **Poppler** installed on the system PATH)
-- Pillow
-
-.. important::
-   SYSTEM REQUIREMENT: Tesseract-OCR and Poppler must be installed and
-   available on the system PATH for the OCR fallback to work.
-   - Tesseract: https://github.com/tesseract-ocr/tesseract
-   - Poppler:   https://github.com/oschwartz10612/poppler-windows (Windows)
 """
 
 from __future__ import annotations
@@ -45,15 +33,7 @@ from typing import Any
 
 import fitz  # PyMuPDF
 
-# ── OCR dependencies (soft import — only needed for scanned PDFs) ────────────
-try:
-    import pytesseract
-    from pdf2image import convert_from_path
-    from PIL import Image
 
-    _OCR_AVAILABLE = True
-except ImportError:
-    _OCR_AVAILABLE = False
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -101,28 +81,10 @@ COAL_GRADES: list[str] = [
 
 NOT_DETECTED = "Not Detected"
 
-#: If the digital text layer has fewer characters than this, trigger OCR.
-#: Raised from 100 → 1000 to catch 'phantom text' (PDFs with only headers
-#: or metadata in their text layer that would otherwise bypass OCR).
-OCR_TEXT_THRESHOLD = 1000
-
-#: Validation keywords that a genuine research-proposal PDF should contain.
-#: Used as a secondary quality gate: even if the text is long enough, it must
-#: contain at least ``VALIDATION_KEYWORD_MIN`` of these terms to be trusted.
-VALIDATION_KEYWORDS: list[str] = [
-    "budget",
-    "proposal",
-    "ministry",
-    "project",
-    "technical",
-]
-VALIDATION_KEYWORD_MIN = 2  # minimum matches required
 
 
-def _count_validation_matches(text: str) -> int:
-    """Count how many ``VALIDATION_KEYWORDS`` appear in *text* (case-insensitive)."""
-    text_lower = text.lower()
-    return sum(1 for kw in VALIDATION_KEYWORDS if kw in text_lower)
+
+
 
 
 # ── Text Cleaning ───────────────────────────────────────────────────────────
@@ -142,77 +104,23 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# ── OCR Engine ──────────────────────────────────────────────────────────────
-
-def perform_ocr(pdf_path: str, dpi: int = 300) -> str:
-    """
-    Convert each page of *pdf_path* to a high-resolution image and run
-    Tesseract OCR on it.
-
-    Parameters
-    ----------
-    pdf_path : str
-        Path to the PDF file.
-    dpi : int
-        Resolution for the page-to-image conversion (default 300).
-
-    Returns
-    -------
-    str
-        Concatenated OCR text from all pages.
-
-    Raises
-    ------
-    pytesseract.TesseractNotFoundError
-        If the Tesseract-OCR executable is not on the system PATH.
-    RuntimeError
-        If the OCR libraries (pytesseract / pdf2image / Pillow) are not
-        installed.
-    """
-    if not _OCR_AVAILABLE:
-        raise RuntimeError(
-            "OCR libraries not installed. "
-            "Run:  pip install pytesseract pdf2image Pillow\n"
-            "Also ensure Tesseract-OCR and Poppler are on the system PATH."
-        )
-
-    # Convert PDF pages → PIL Image objects at the requested DPI
-    images: list[Image.Image] = convert_from_path(pdf_path, dpi=dpi)
-
-    ocr_parts: list[str] = []
-    for idx, img in enumerate(images, start=1):
-        page_text = pytesseract.image_to_string(img)
-        if page_text:
-            ocr_parts.append(page_text)
-
-    return "\n".join(ocr_parts)
-
-
-# ── Text Extraction (with OCR fallback) ─────────────────────────────────────
+# ── Text Extraction (digital only) ──────────────────────────────────────────
 
 def extract_text(pdf_path: str) -> tuple[str, bool]:
     """
-    Extract text from *pdf_path*.
-
-    **Primary path:** PyMuPDF digital text extraction.
-    **Fallback:** OCR is triggered when *either* condition is true:
-
-    1. The digital text has fewer than ``OCR_TEXT_THRESHOLD`` characters
-       (likely a scanned document or near-empty text layer).
-    2. Fewer than ``VALIDATION_KEYWORD_MIN`` validation keywords are found
-       (the text layer is probably phantom/header-only metadata).
+    Extract digital text from *pdf_path* using PyMuPDF.
 
     Returns
     -------
-    (text, is_ocr) : tuple[str, bool]
-        The cleaned text and a flag indicating whether OCR was used.
+    (text, False) : tuple[str, bool]
+        The cleaned text (or a default placeholder if empty) and a
+        constant ``False`` (kept for API compatibility).
     """
     if not os.path.isfile(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
     basename = os.path.basename(pdf_path)
 
-    # ── 1. Try digital text extraction (PyMuPDF) ────────────────────────
     text_parts: list[str] = []
     with fitz.open(pdf_path) as doc:
         for page in doc:
@@ -221,44 +129,14 @@ def extract_text(pdf_path: str) -> tuple[str, bool]:
                 text_parts.append(page_text)
 
     digital_text = "\n".join(text_parts)
-    is_ocr = False
-
-    # ── 2. Decide: trust the digital text or fall back to OCR? ──────────
     text_len = len(digital_text.strip())
-    kw_matches = _count_validation_matches(digital_text)
 
-    needs_ocr = False
-    ocr_reason = ""
+    if text_len == 0:
+        print(f"[DIGITAL] {basename}: No digital text found in PDF.")
+        return "No digital text found", False
 
-    if text_len < OCR_TEXT_THRESHOLD:
-        needs_ocr = True
-        ocr_reason = (
-            f"Digital text too short ({text_len} chars < {OCR_TEXT_THRESHOLD} threshold)"
-        )
-    elif kw_matches < VALIDATION_KEYWORD_MIN:
-        needs_ocr = True
-        ocr_reason = (
-            f"Low keyword density detected ({kw_matches}/{VALIDATION_KEYWORD_MIN} "
-            f"validation keywords found), forcing OCR"
-        )
-
-    if needs_ocr:
-        print(f"[OCR] {basename}: {ocr_reason}. Switching to OCR path...")
-        try:
-            digital_text = perform_ocr(pdf_path)
-            is_ocr = True
-            print(f"[OCR] {basename}: OCR extraction completed successfully.")
-        except Exception as exc:
-            # If OCR also fails, proceed with whatever digital text we have
-            print(f"[OCR] {basename}: OCR failed ({exc}), using available digital text.")
-    else:
-        print(
-            f"[DIGITAL] {basename}: Digital text layer accepted "
-            f"({text_len} chars, {kw_matches} validation keywords matched)."
-        )
-
-    # ── 3. Standardise ──────────────────────────────────────────────────
-    return clean_text(digital_text), is_ocr
+    print(f"[DIGITAL] {basename}: Digital text layer accepted ({text_len} chars).")
+    return clean_text(digital_text), False
 
 
 # ── Field Extractors ────────────────────────────────────────────────────────
@@ -486,11 +364,11 @@ def extract_metadata(pdf_path: str) -> dict[str, Any]:
       "budget": "...",
       "timeline": "...",
       "keywords": ["...", "..."],
-      "extraction_method": "Digital Text Layer" | "OCR (Scanned Document)"
+      "extraction_method": "Digital Text Layer"
     }
     ```
     """
-    text, is_ocr = extract_text(pdf_path)
+    text, _ = extract_text(pdf_path)
 
     title = _extract_title(text)
     pi = _extract_pi(text)
@@ -510,7 +388,7 @@ def extract_metadata(pdf_path: str) -> dict[str, Any]:
         "timeline": timeline,
         "coal_grade": coal_grade,
         "keywords": keywords if keywords else NOT_DETECTED,
-        "extraction_method": "OCR (Scanned Document)" if is_ocr else "Digital Text Layer",
+        "extraction_method": "Digital Text Layer",
     }
 
 

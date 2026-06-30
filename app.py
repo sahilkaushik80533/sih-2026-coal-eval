@@ -665,7 +665,7 @@ def submit_to_sheets(conn, scored: dict[str, Any]) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def extract_from_upload(uploaded_file) -> tuple[dict[str, Any], bool]:
+def extract_from_upload(uploaded_file) -> dict[str, Any]:
     """Save an uploaded PDF to a temp file, run extraction_engine."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.getbuffer())
@@ -675,8 +675,7 @@ def extract_from_upload(uploaded_file) -> tuple[dict[str, Any], bool]:
         metadata["source_file"] = uploaded_file.name
     finally:
         os.unlink(tmp_path)
-    is_ocr = metadata.get("extraction_method", "").startswith("OCR")
-    return metadata, is_ocr
+    return metadata
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -933,12 +932,15 @@ if nav == "📋 View Records":
         display_df = display_df.copy()
         display_df.insert(0, "Rank", range(1, len(display_df) + 1))
 
-        # ── PyArrow fix: coerce mixed-type columns to str ────────────────
-        _pyarrow_col = "LIST OF ONGOING S&T PROJECTS (As on 15.02.2026)"
-        if _pyarrow_col in display_df.columns:
-            display_df[_pyarrow_col] = display_df[_pyarrow_col].astype(str)
+        # ── PyArrow fix: coerce ALL columns to str before display ────────
+        display_df = display_df.astype(str)
 
         # ── Styled dataframe with gradient on Total Score & Innovation ───
+        # Re-cast numeric columns back so gradients work on numbers
+        for _nc in ["Total Score", "Technical Innovation"]:
+            if _nc in display_df.columns:
+                display_df[_nc] = pd.to_numeric(display_df[_nc], errors="coerce").fillna(0)
+
         styled = display_df.style
         if "Total Score" in display_df.columns:
             styled = styled.background_gradient(
@@ -1031,6 +1033,18 @@ if nav == "➕ New Entry":
                 st.session_state["_smart_fill"] = result
                 st.session_state["_smart_pdf_name"] = scan_pdf.name
 
+                # Store extracted text for downstream analysis
+                from extraction_engine import extract_text as _ext_text
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as _txt_tmp:
+                    _txt_tmp.write(scan_pdf.getbuffer())
+                    _txt_tmp_path = _txt_tmp.name
+                try:
+                    _raw, _ = _ext_text(_txt_tmp_path)
+                    st.session_state["extracted_text"] = _raw
+                finally:
+                    if os.path.exists(_txt_tmp_path):
+                        os.unlink(_txt_tmp_path)
+
                 flags = result["confidence_flags"]
                 conf = result["confidence_score"]
                 method = result["extraction_method"]
@@ -1084,6 +1098,7 @@ if nav == "➕ New Entry":
                                 raw_text, gemini_key,
                             )
                             st.session_state["_ai_scores"] = ai_result
+                            st.session_state["extracted_text"] = raw_text
                         except Exception as exc:
                             st.error(f"AI analysis failed: {exc}", icon="❌")
                             ai_result = None
@@ -1268,6 +1283,51 @@ if nav == "➕ New Entry":
                 "auto-filled into the evaluation sliders below.",
                 icon="⬇️",
             )
+
+    # ═══ 🤖 DEEP AI ANALYSIS — RUN SEMANTIC ANALYSIS ═════════════════════════
+    st.divider()
+    st.subheader("🤖 Deep AI Analysis")
+
+    run_deep_analysis = st.button(
+        "🔍 Run Semantic Analysis",
+        type="primary",
+        use_container_width=True,
+        key="run_deep_semantic_btn",
+    )
+
+    if run_deep_analysis:
+        if not st.session_state.get("extracted_text"):
+            st.warning(
+                "⬆️ Please upload and extract a PDF first using the "
+                "**Smart Extract & AI Scoring** panel above.",
+                icon="⚠️",
+            )
+        else:
+            with st.spinner("Ministry AI is analyzing the proposal…"):
+                try:
+                    deep_result = get_semantic_analysis(
+                        st.session_state["extracted_text"]
+                    )
+                    st.session_state["_deep_analysis"] = deep_result
+                    st.success(
+                        f"**Semantic Analysis complete!** · Model: `{deep_result['model']}`",
+                        icon="✅",
+                    )
+                    st.write(deep_result)
+                except Exception as exc:
+                    st.error(
+                        f"**Semantic Analysis failed:** {exc}",
+                        icon="❌",
+                    )
+
+    # Show persisted results on reruns
+    if st.session_state.get("_deep_analysis") and not run_deep_analysis:
+        deep = st.session_state["_deep_analysis"]
+        st.success(
+            f"**Semantic Analysis results** · Model: `{deep['model']}`",
+            icon="✅",
+        )
+        st.write(deep)
 
     # ── Read pre-fill values from session state (or defaults) ──────────
     sf = st.session_state.get("_smart_fill", {})
@@ -1488,15 +1548,8 @@ if new_files:
     for uf in new_files:
         try:
             with st.status(f"Processing **{uf.name}** …", expanded=True) as status:
-                st.write("Attempting digital text extraction (PyMuPDF)…")
-                metadata, is_ocr = extract_from_upload(uf)
-
-                if is_ocr:
-                    st.info(
-                        "Digital text layer not detected. "
-                        "Initializing OCR Engine for scanned document analysis…",
-                        icon="🔍",
-                    )
+                st.write("Extracting digital text (PyMuPDF)…")
+                metadata = extract_from_upload(uf)
 
                 st.write(f"Extraction method: **{metadata.get('extraction_method', 'Digital Text Layer')}**")
                 st.write("Calculating score…")
@@ -1506,34 +1559,12 @@ if new_files:
                 scored["source_file"] = metadata.get("source_file", uf.name)
                 scored["extraction_method"] = metadata.get("extraction_method", "Digital Text Layer")
 
-                if is_ocr:
-                    existing_j = scored.get("justification", "")
-                    ocr_note = "Source: Scanned Image (OCR processed)"
-                    scored["justification"] = f"{ocr_note}. {existing_j}" if existing_j else ocr_note
-
                 st.session_state.scored_proposals.append(scored)
                 st.session_state.processed_names.add(uf.name)
                 status.update(label=f"**{uf.name}** — done!", state="complete")
 
-        except RuntimeError as exc:
-            st.error(
-                f"**OCR Error for {uf.name}:** {exc}\n\n"
-                "**How to fix:**\n"
-                "1. `pip install pytesseract pdf2image Pillow`\n"
-                "2. Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) → system PATH\n"
-                "3. Install [Poppler](https://github.com/oschwartz10612/poppler-windows) → system PATH",
-                icon="⚠️",
-            )
         except Exception as exc:
-            if "TesseractNotFound" in type(exc).__name__:
-                st.error(
-                    f"**Tesseract OCR not found** while processing **{uf.name}**.\n\n"
-                    "Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) "
-                    "and ensure `tesseract` is on your system PATH.",
-                    icon="⚠️",
-                )
-            else:
-                st.error(f"Failed to process **{uf.name}**: {exc}", icon="❌")
+            st.error(f"Failed to process **{uf.name}**: {exc}", icon="❌")
 
 # Handle file removals
 current_names = {f.name for f in uploaded_files}
@@ -1632,7 +1663,7 @@ with tab_dash:
     ])
 
     st.dataframe(
-        df, width="stretch", hide_index=True,
+        df.astype(str), width="stretch", hide_index=True,
         column_config={
             "Rank": st.column_config.NumberColumn(width="small"),
             "Total Score": st.column_config.NumberColumn(format="%.1f"),
@@ -1757,7 +1788,7 @@ with tab_compare:
                     b["timeline_score"], f"+{b['pi_bonus']}", b["total_score"],
                 ],
             })
-            st.dataframe(cmp_df, width="stretch", hide_index=True)
+            st.dataframe(cmp_df.astype(str), width="stretch", hide_index=True)
 
             st.markdown("#### Score Breakdown")
             ch1, ch2 = st.columns(2)
