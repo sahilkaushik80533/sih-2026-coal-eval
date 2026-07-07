@@ -40,7 +40,7 @@ except ImportError:
 MAX_TEXT_CHARS = 30_000
 
 #: Model name — stable endpoint; avoid `-latest` aliases which may 404.
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 #: Fallback models to try if the primary model returns a 404.
 FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-pro"]
