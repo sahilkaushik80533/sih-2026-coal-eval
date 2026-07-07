@@ -477,6 +477,14 @@ def fetch_sheet_data(_conn, worksheet: str = "Sheet1") -> pd.DataFrame | None:
         data = _conn.read(worksheet=worksheet)
         if data is not None and not data.empty:
             data = data.dropna(how="all")
+            # ── PyArrow fix: coerce mixed-type columns to str ────────
+            # Google Sheets can return columns with mixed int/str/None
+            # values, which causes ArrowTypeError when Streamlit converts
+            # the DataFrame to Arrow for display.  Force every non-numeric
+            # column to a uniform string type.
+            for col in data.columns:
+                if data[col].dtype == "object":
+                    data[col] = data[col].fillna("").astype(str)
         return data
     except FileNotFoundError:
         st.error(
