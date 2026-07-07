@@ -137,7 +137,7 @@ def get_semantic_analysis(text: str) -> dict:
     Call the Gemini API as a *Ministry of Coal Technical Auditor* and return
     a structured evaluation of the proposal text.
 
-    Uses ``gemini-1.5-pro-latest`` via the new ``google.genai`` Client SDK
+    Uses ``gemini-1.5-pro`` via the new ``google.genai`` Client SDK
     with all safety categories set to ``BLOCK_NONE`` to prevent false flags
     on coal-mining terminology.
 
@@ -214,7 +214,7 @@ Rules:
 - Be strict: 8+ requires strong, explicit evidence.
 """
 
-    model_name = "gemini-1.5-pro-latest"
+    model_name = "gemini-1.5-pro"
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,

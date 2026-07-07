@@ -39,8 +39,8 @@ except ImportError:
 #: well within free-tier limits and keep latency low.
 MAX_TEXT_CHARS = 30_000
 
-#: Model name — use the `-latest` alias to avoid 404 on deprecated endpoints.
-MODEL_NAME = "gemini-1.5-pro-latest"
+#: Model name — stable endpoint; avoid `-latest` aliases which may 404.
+MODEL_NAME = "gemini-1.5-pro"
 
 #: Fallback models to try if the primary model returns a 404.
 FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-pro"]
@@ -167,7 +167,7 @@ def analyze_proposal(
     api_key : str
         Google Gemini API key.
     model_name : str, optional
-        Model to use.  Defaults to ``MODEL_NAME`` (``gemini-1.5-pro-latest``).
+        Model to use.  Defaults to ``MODEL_NAME`` (``gemini-1.5-pro``).
 
     Returns
     -------
