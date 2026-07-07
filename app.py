@@ -1,7 +1,7 @@
 """
 app.py
 ======
-Streamlit front-end for the SIH 2026 R&D Proposal Evaluation System.
+Streamlit front-end for the Ministry of Coal R&D Proposal Evaluation System.
 
 Integrates:
   - extraction_engine.py  → PDF → structured metadata
@@ -288,7 +288,7 @@ PROPOSAL_COLUMNS: list[str] = [
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SIH 2026 · R&D Proposal Evaluator",
+    page_title="Ministry of Coal · R&D Proposal Evaluator",
     page_icon="⚒️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -825,7 +825,7 @@ with st.sidebar:
         st.caption("Contact administrator to restore connectivity.")
 
     st.markdown("---")
-    st.caption("SIH 2026 · Built with Streamlit")
+    st.caption("Ministry of Coal R&D Evaluator · Built with Streamlit")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -836,7 +836,7 @@ st.markdown(
     """
     <div class="main-header">
         <h1>R&D Proposal Evaluation Dashboard</h1>
-        <p>Smart India Hackathon 2026 — Ministry of Coal · Automated Scoring & Comparison</p>
+        <p>Ministry of Coal · Automated R&D Scoring & Comparison</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1033,7 +1033,7 @@ if nav == "➕ New Entry":
                 st.session_state["_smart_fill"] = result
                 st.session_state["_smart_pdf_name"] = scan_pdf.name
 
-                # Store extracted text for downstream analysis
+                # Store extracted text for downstream semantic analysis
                 from extraction_engine import extract_text as _ext_text
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as _txt_tmp:
                     _txt_tmp.write(scan_pdf.getbuffer())
@@ -1551,6 +1551,18 @@ if new_files:
                 st.write("Extracting digital text (PyMuPDF)…")
                 metadata = extract_from_upload(uf)
 
+                # Also store the raw text for semantic analysis
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as _ev_tmp:
+                    _ev_tmp.write(uf.getbuffer())
+                    _ev_tmp_path = _ev_tmp.name
+                try:
+                    from extraction_engine import extract_text as _ev_ext
+                    _ev_raw, _ = _ev_ext(_ev_tmp_path)
+                    st.session_state["extracted_text"] = _ev_raw
+                finally:
+                    if os.path.exists(_ev_tmp_path):
+                        os.unlink(_ev_tmp_path)
+
                 st.write(f"Extraction method: **{metadata.get('extraction_method', 'Digital Text Layer')}**")
                 st.write("Calculating score…")
 
@@ -1584,6 +1596,55 @@ if not proposals:
 proposals_ranked = sorted(proposals, key=lambda s: s["total_score"], reverse=True)
 title_map: dict[str, dict] = {s["title"]: s for s in proposals_ranked}
 titles = list(title_map.keys())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  🤖 DEEP AI ANALYSIS — PROPOSAL EVALUATOR PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.subheader("🤖 Deep AI Analysis")
+
+run_eval_semantic = st.button(
+    "🔍 Run Semantic Analysis",
+    type="primary",
+    use_container_width=True,
+    key="run_eval_semantic_btn",
+)
+
+if run_eval_semantic:
+    if not st.session_state.get("extracted_text"):
+        st.warning(
+            "👈 Upload a PDF proposal from the sidebar first. "
+            "The text will be extracted automatically.",
+            icon="⚠️",
+        )
+    else:
+        with st.spinner("Ministry AI is analyzing the proposal…"):
+            try:
+                deep_result = get_semantic_analysis(
+                    st.session_state["extracted_text"]
+                )
+                st.session_state["_deep_analysis_eval"] = deep_result
+                st.success(
+                    f"**Semantic Analysis complete!** · Model: `{deep_result['model']}`",
+                    icon="✅",
+                )
+                st.write(deep_result)
+            except Exception as exc:
+                st.error(
+                    f"**Semantic Analysis failed:** {exc}",
+                    icon="❌",
+                )
+
+# Show persisted results on reruns
+if st.session_state.get("_deep_analysis_eval") and not run_eval_semantic:
+    deep_ev = st.session_state["_deep_analysis_eval"]
+    st.success(
+        f"**Semantic Analysis results** · Model: `{deep_ev['model']}`",
+        icon="✅",
+    )
+    st.write(deep_ev)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
