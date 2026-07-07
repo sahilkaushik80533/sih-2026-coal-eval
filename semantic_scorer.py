@@ -119,20 +119,12 @@ def _clean_and_truncate(text: str) -> str:
 
 def _extract_json(raw: str) -> dict[str, Any]:
     """
-    Extract the first JSON object from *raw* text.
+    Parse the JSON object returned by the Gemini API.
 
-    Handles cases where Gemini wraps the JSON in markdown code fences.
+    With ``response_mime_type="application/json"`` the API guarantees
+    raw JSON, so no markdown-fence stripping is needed.
     """
-    # Strip markdown fences if present
-    raw = re.sub(r"```(?:json)?\s*", "", raw)
-    raw = raw.strip().rstrip("`")
-
-    # Find the first { … } block
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not m:
-        raise ValueError(f"No JSON object found in AI response:\n{raw[:500]}")
-
-    return json.loads(m.group())
+    return json.loads(raw.strip())
 
 
 def _clamp(value: Any, lo: int = 1, hi: int = 10) -> int:
@@ -210,6 +202,7 @@ def analyze_proposal(
                 model=candidate,
                 contents=f"Evaluate the following R&D proposal:\n\n{cleaned}",
                 config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.2,       # low creativity → consistent scores
                     max_output_tokens=512, # JSON should be tiny

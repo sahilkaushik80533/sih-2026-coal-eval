@@ -220,6 +220,7 @@ Rules:
         model=model_name,
         contents=f"Evaluate the following R&D proposal:\n\n{cleaned}",
         config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
             system_instruction=RUBRIC_PROMPT,
             temperature=0.2,
             max_output_tokens=512,
@@ -244,12 +245,7 @@ Rules:
         ),
     )
 
-    raw = response.text
-    raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not m:
-        raise ValueError(f"No JSON object in AI response:\n{raw[:500]}")
-    parsed = json.loads(m.group())
+    parsed = json.loads(response.text.strip())
 
     def _clamp(v, lo=1, hi=10):
         try:
