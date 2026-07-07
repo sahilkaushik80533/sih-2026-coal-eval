@@ -128,6 +128,13 @@ def _resolve_gemini_key() -> str:
     return key
 
 
+# ── DataFrame sanitizer — prevents PyArrow ArrowTypeError ────────────────────
+
+def sanitize_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """Force every cell to a clean string, replacing NaN/None with empty string."""
+    return df.map(lambda x: "" if pd.isna(x) or x is None else str(x))
+
+
 # ── Safety settings — BLOCK_NONE to avoid false flags on mining terms ────────
 # Now constructed as google.genai types.SafetySetting objects at call time.
 
@@ -936,8 +943,8 @@ if nav == "📋 View Records":
         display_df = display_df.copy()
         display_df.insert(0, "Rank", range(1, len(display_df) + 1))
 
-        # ── PyArrow fix: coerce ALL columns to str before display ────────
-        display_df = display_df.astype(str)
+        # ── PyArrow fix: coerce ALL object columns to str before display ──
+        display_df = sanitize_for_streamlit(display_df)
 
         # ── Styled dataframe with gradient on Total Score & Innovation ───
         # Re-cast numeric columns back so gradients work on numbers
@@ -1728,7 +1735,7 @@ with tab_dash:
     ])
 
     st.dataframe(
-        df.astype(str), width="stretch", hide_index=True,
+        sanitize_for_streamlit(df), width="stretch", hide_index=True,
         column_config={
             "Rank": st.column_config.NumberColumn(width="small"),
             "Total Score": st.column_config.NumberColumn(format="%.1f"),
@@ -1853,7 +1860,7 @@ with tab_compare:
                     b["timeline_score"], f"+{b['pi_bonus']}", b["total_score"],
                 ],
             })
-            st.dataframe(cmp_df.astype(str), width="stretch", hide_index=True)
+            st.dataframe(sanitize_for_streamlit(cmp_df), width="stretch", hide_index=True)
 
             st.markdown("#### Score Breakdown")
             ch1, ch2 = st.columns(2)
