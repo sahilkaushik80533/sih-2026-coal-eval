@@ -214,7 +214,7 @@ Rules:
 - Be strict: 8+ requires strong, explicit evidence.
 """
 
-    model_name = "gemini-1.5-pro"
+    model_name = "gemini-1.5-flash"
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,
