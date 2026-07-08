@@ -50,6 +50,7 @@ from proposal_ranker import (
     PRIORITY_KEYWORDS,
 )
 import semantic_scorer
+from semantic_scorer import parse_ai_response
 from data_processing import (
     clean_dataframe_for_streamlit,
     coerce_sheet_columns,
@@ -60,6 +61,8 @@ from data_processing import (
     build_ranked_table,
     build_comparison_table,
     apply_leaderboard_gradient,
+    normalize_json_keys,
+    normalize_ai_score_keys,
 )
 
 # ── Google Drive API (for PDF uploads — no temp files) ───────────────────────
@@ -223,6 +226,18 @@ Rules:
 - Return ONLY the raw JSON object — no markdown fences, no extra commentary.
 - If evidence is ambiguous, default to 5.
 - Be strict: 8+ requires strong, explicit evidence.
+
+You MUST use these exact property names: "innovation_score", "feasibility_score",
+"impact_score", "technical_summary".  Do not rename or paraphrase them.
+
+When the proposal text contains structured metadata, also extract and return
+these additional fields (leave as empty string if not found):
+  "Project Name": "<title of the project>",
+  "Sponsoring Agency": "<funding body or agency>",
+  "Budget": "<total budget string>",
+  "Duration": "<project duration string>"
+
+CRITICAL: You must return ONLY strictly valid JSON. All property names and string values must be enclosed in double quotes. Do not include trailing commas. Do not wrap the response in markdown blocks.
 """
 
     model_name = "gemini-2.5-flash"
@@ -256,7 +271,7 @@ Rules:
         ),
     )
 
-    parsed = json.loads(response.text.strip())
+    parsed = parse_ai_response(response.text)
 
     def _clamp(v, lo=1, hi=10):
         try:
@@ -264,13 +279,14 @@ Rules:
         except (TypeError, ValueError):
             return 5
 
-    return {
+    raw_result = {
         "innovation_score": _clamp(parsed.get("innovation_score")),
         "feasibility_score": _clamp(parsed.get("feasibility_score")),
         "impact_score": _clamp(parsed.get("impact_score")),
         "technical_summary": str(parsed.get("technical_summary", "No summary provided.")),
         "model": model_name,
     }
+    return normalize_ai_score_keys(raw_result)
 
 def calculate_eval_score(
     innovation: int, economic: int, environmental: int, alignment: int,
@@ -1183,14 +1199,14 @@ if nav == "➕ New Entry":
         if sem:
             # Map semantic scores → evaluation sliders
             st.session_state.setdefault("_ai_scores", {})
-            st.session_state["_ai_scores"]["technical_innovation"] = sem["innovation_score"]
-            st.session_state["_ai_scores"]["economic_viability"] = sem["feasibility_score"]
-            st.session_state["_ai_scores"]["environmental_sustainability"] = sem["impact_score"]
+            st.session_state["_ai_scores"]["technical_innovation"] = sem["technical_innovation"]
+            st.session_state["_ai_scores"]["economic_viability"] = sem["economic_viability"]
+            st.session_state["_ai_scores"]["environmental_sustainability"] = sem["environmental_sustainability"]
 
             # ── Confidence Card ──────────────────────────────────────
-            inn = sem["innovation_score"]
-            feas = sem["feasibility_score"]
-            imp = sem["impact_score"]
+            inn = sem["technical_innovation"]
+            feas = sem["economic_viability"]
+            imp = sem["environmental_sustainability"]
             avg = round((inn + feas + imp) / 3, 1)
 
             # Colour coding
@@ -1241,7 +1257,7 @@ if nav == "➕ New Entry":
                     </table>
                     <hr style="border-color:rgba(255,255,255,0.1); margin:.8rem 0;">
                     <p style="margin:0; color:#cfd8dc; font-size:.92rem;">
-                        📝 <em>{sem['technical_summary']}</em>
+                        📝 <em>{sem['reasoning']}</em>
                     </p>
                     <p style="margin:.5rem 0 0 0; color:#90a4ae; font-size:.8rem;">
                         Model: <code>{sem['model']}</code>

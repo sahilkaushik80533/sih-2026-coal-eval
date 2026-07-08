@@ -18,9 +18,12 @@ The API key is read from ``st.secrets["GEMINI_API_KEY"]`` at call time.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any
+
+from data_processing import normalize_ai_score_keys
 
 # ── Soft import — the app still works without the Gemini SDK ─────────────────
 try:
@@ -101,11 +104,23 @@ Return your response **only** as a raw JSON object with this exact schema:
   "technical_summary": "<exactly 2 sentences>"
 }
 
+You MUST use these exact property names: "innovation_score", "feasibility_score",
+"impact_score", "technical_summary".  Do not rename or paraphrase them.
+
+When the proposal text contains structured metadata, also extract and return
+these additional fields (leave as empty string if not found):
+  "Project Name": "<title of the project>",
+  "Sponsoring Agency": "<funding body or agency>",
+  "Budget": "<total budget string>",
+  "Duration": "<project duration string>"
+
 Rules:
 - Return ONLY the raw JSON object.  No markdown fences, no backticks, no
   extra text before or after the JSON.
 - Choose a score of 5 if the evidence is unclear or ambiguous.
 - Be strict: a score of 8+ requires strong, explicit evidence in the text.
+
+CRITICAL: You must return ONLY strictly valid JSON. All property names and string values must be enclosed in double quotes. Do not include trailing commas. Do not wrap the response in markdown blocks.
 """
 
 
@@ -117,14 +132,53 @@ def _clean_and_truncate(text: str) -> str:
     return text
 
 
-def _extract_json(raw: str) -> dict[str, Any]:
+def parse_ai_response(raw_text: str) -> dict[str, Any]:
     """
-    Parse the JSON object returned by the Gemini API.
+    Resilient JSON parser for AI responses.
 
-    With ``response_mime_type="application/json"`` the API guarantees
-    raw JSON, so no markdown-fence stripping is needed.
+    Handles common LLM output issues:
+    - Strips markdown code fences (```json ... ```)
+    - Removes trailing commas before } or ]
+    - Falls back to ``ast.literal_eval`` for single-quoted JSON
+    - Falls back to regex field extraction as a last resort
     """
-    return json.loads(raw.strip())
+    # Step 1: strip markdown fences
+    clean = re.sub(r"```(?:json)?\n?", "", raw_text)
+    clean = re.sub(r"```", "", clean)
+    clean = clean.strip()
+
+    # Step 2: remove trailing commas (e.g.  {"a": 1,})
+    clean = re.sub(r",\s*([}\]])", r"\1", clean)
+
+    # Step 3: try standard json.loads
+    try:
+        return json.loads(clean)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Step 4: try ast.literal_eval (handles single-quoted dicts)
+    try:
+        result = ast.literal_eval(clean)
+        if isinstance(result, dict):
+            return result
+    except (ValueError, SyntaxError):
+        pass
+
+    # Step 5: regex fallback — extract known fields
+    def _re_int(key: str) -> int:
+        m = re.search(rf'"{key}"\s*:\s*(\d+)', clean)
+        return int(m.group(1)) if m else 5
+
+    def _re_str(key: str) -> str:
+        m = re.search(rf'"{key}"\s*:\s*"(.*?)"', clean, re.DOTALL)
+        return m.group(1) if m else ""
+
+    return {
+        "innovation_score": _re_int("innovation_score"),
+        "feasibility_score": _re_int("feasibility_score"),
+        "impact_score": _re_int("impact_score"),
+        "technical_summary": _re_str("technical_summary") or "No summary provided.",
+    }
 
 
 def _clamp(value: Any, lo: int = 1, hi: int = 10) -> int:
@@ -229,9 +283,9 @@ def analyze_proposal(
             f"Models attempted: {models_to_try}"
         )
 
-    parsed = _extract_json(raw_text)
+    parsed = parse_ai_response(raw_text)
 
-    return {
+    scored = {
         "innovation_score": _clamp(parsed.get("innovation_score")),
         "feasibility_score": _clamp(parsed.get("feasibility_score")),
         "impact_score": _clamp(parsed.get("impact_score")),
@@ -240,3 +294,10 @@ def analyze_proposal(
         ),
         "model": used_model,
     }
+
+    # Copy any extracted metadata fields through
+    for meta_key in ("Project Name", "Sponsoring Agency", "Budget", "Duration"):
+        if meta_key in parsed:
+            scored[meta_key] = parsed[meta_key]
+
+    return normalize_ai_score_keys(scored)
