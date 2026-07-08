@@ -50,6 +50,17 @@ from proposal_ranker import (
     PRIORITY_KEYWORDS,
 )
 import semantic_scorer
+from data_processing import (
+    clean_dataframe_for_streamlit,
+    coerce_sheet_columns,
+    sort_by_total_score,
+    filter_by_search,
+    add_rank_column,
+    rank_proposals,
+    build_ranked_table,
+    build_comparison_table,
+    apply_leaderboard_gradient,
+)
 
 # ── Google Drive API (for PDF uploads — no temp files) ───────────────────────
 try:
@@ -128,14 +139,7 @@ def _resolve_gemini_key() -> str:
     return key
 
 
-# ── DataFrame sanitizer — prevents PyArrow ArrowTypeError ────────────────────
 
-def sanitize_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
-    """Force every cell to a clean string, replacing NaN/None with empty string."""
-    return df.map(lambda x: "" if pd.isna(x) or x is None else str(x))
-
-
-# ── Safety settings — BLOCK_NONE to avoid false flags on mining terms ────────
 # Now constructed as google.genai types.SafetySetting objects at call time.
 
 
@@ -484,14 +488,7 @@ def fetch_sheet_data(_conn, worksheet: str = "Sheet1") -> pd.DataFrame | None:
         data = _conn.read(worksheet=worksheet)
         if data is not None and not data.empty:
             data = data.dropna(how="all")
-            # ── PyArrow fix: coerce mixed-type columns to str ────────
-            # Google Sheets can return columns with mixed int/str/None
-            # values, which causes ArrowTypeError when Streamlit converts
-            # the DataFrame to Arrow for display.  Force every non-numeric
-            # column to a uniform string type.
-            for col in data.columns:
-                if data[col].dtype == "object":
-                    data[col] = data[col].fillna("").astype(str)
+            data = coerce_sheet_columns(data)
         return data
     except FileNotFoundError:
         st.error(
@@ -875,18 +872,9 @@ if nav == "📋 View Records":
     if sheet_df is None or sheet_df.empty:
         st.info("The Google Sheet is empty — no records to display yet.", icon="📭")
     else:
-        # Ensure Total Score is numeric for sorting
-        if "Total Score" in sheet_df.columns:
-            sheet_df["Total Score"] = pd.to_numeric(
-                sheet_df["Total Score"], errors="coerce"
-            ).fillna(0)
-            sheet_df = sheet_df.sort_values("Total Score", ascending=False).reset_index(drop=True)
-
-        # Ensure Innovation is numeric for metrics
-        if "Technical Innovation" in sheet_df.columns:
-            sheet_df["Technical Innovation"] = pd.to_numeric(
-                sheet_df["Technical Innovation"], errors="coerce"
-            ).fillna(0)
+        # Coerce, sort, and prepare for display
+        sheet_df = coerce_sheet_columns(sheet_df)
+        sheet_df = sort_by_total_score(sheet_df)
 
         # ── Metrics Summary ──────────────────────────────────────────────
         vm1, vm2, vm3, vm4 = st.columns(4)
@@ -931,42 +919,16 @@ if nav == "📋 View Records":
             placeholder="Type to filter across all columns…",
             key="view_search",
         )
-        display_df = sheet_df.copy()
+        display_df = filter_by_search(sheet_df, search_term)
         if search_term:
-            mask = sheet_df.astype(str).apply(
-                lambda col: col.str.contains(search_term, case=False, na=False)
-            ).any(axis=1)
-            display_df = sheet_df[mask]
             st.caption(f"Showing {len(display_df)} of {len(sheet_df)} records.")
 
         # Add rank column
-        display_df = display_df.copy()
-        display_df.insert(0, "Rank", range(1, len(display_df) + 1))
+        display_df = add_rank_column(display_df)
 
-        # ── PyArrow fix: coerce ALL object columns to str before display ──
-        display_df = sanitize_for_streamlit(display_df)
-
-        # ── Styled dataframe with gradient on Total Score & Innovation ───
-        # Re-cast numeric columns back so gradients work on numbers
-        for _nc in ["Total Score", "Technical Innovation"]:
-            if _nc in display_df.columns:
-                display_df[_nc] = pd.to_numeric(display_df[_nc], errors="coerce").fillna(0)
-
-        styled = display_df.style
-        if "Total Score" in display_df.columns:
-            styled = styled.background_gradient(
-                subset=["Total Score"],
-                cmap="RdYlGn",
-                vmin=0,
-                vmax=100,
-            )
-        if "Technical Innovation" in display_df.columns:
-            styled = styled.background_gradient(
-                subset=["Technical Innovation"],
-                cmap="YlOrRd",
-                vmin=1,
-                vmax=10,
-            )
+        # Sanitize then apply gradient styling
+        display_df = clean_dataframe_for_streamlit(display_df)
+        styled = apply_leaderboard_gradient(display_df)
 
         st.dataframe(
             styled,
@@ -1604,7 +1566,7 @@ if not proposals:
     st.info("Upload PDF proposals from the sidebar to begin evaluation.")
     st.stop()
 
-proposals_ranked = sorted(proposals, key=lambda s: s["total_score"], reverse=True)
+proposals_ranked = rank_proposals(proposals)
 title_map: dict[str, dict] = {s["title"]: s for s in proposals_ranked}
 titles = list(title_map.keys())
 
@@ -1717,25 +1679,10 @@ with tab_dash:
 
     # ── Ranked table ─────────────────────────────────────────────────────
     st.markdown("### Ranked Proposals")
-    df = pd.DataFrame([
-        {
-            "Rank": idx,
-            "Proposal Title": s["title"],
-            "PI": s["pi"],
-            "Budget": s["budget_raw"],
-            "Timeline": s["timeline_raw"],
-            "Budget Score (/30)": s["budget_score"],
-            "Keyword Score (/50)": s["keyword_score"],
-            "Timeline Score (/20)": s["timeline_score"],
-            "PI Bonus": s["pi_bonus"],
-            "Total Score": s["total_score"],
-            "Justification": s.get("justification", ""),
-        }
-        for idx, s in enumerate(proposals_ranked, 1)
-    ])
+    df = build_ranked_table(proposals_ranked)
 
     st.dataframe(
-        sanitize_for_streamlit(df), width="stretch", hide_index=True,
+        clean_dataframe_for_streamlit(df), width="stretch", hide_index=True,
         column_config={
             "Rank": st.column_config.NumberColumn(width="small"),
             "Total Score": st.column_config.NumberColumn(format="%.1f"),
@@ -1840,27 +1787,8 @@ with tab_compare:
             a = title_map[pick_a]
             b = title_map[pick_b]
 
-            cmp_df = pd.DataFrame({
-                "Metric": [
-                    "PI", "PI Rank", "Budget", "Timeline",
-                    "Priority Keywords Matched",
-                    "Budget Score (/30)", "Keyword Score (/50)",
-                    "Timeline Score (/20)", "PI Bonus", "TOTAL SCORE",
-                ],
-                pick_a: [
-                    a["pi"], a["pi_rank"], a["budget_raw"], a["timeline_raw"],
-                    ", ".join(a["matched_keywords"]) or "None",
-                    a["budget_score"], a["keyword_score"],
-                    a["timeline_score"], f"+{a['pi_bonus']}", a["total_score"],
-                ],
-                pick_b: [
-                    b["pi"], b["pi_rank"], b["budget_raw"], b["timeline_raw"],
-                    ", ".join(b["matched_keywords"]) or "None",
-                    b["budget_score"], b["keyword_score"],
-                    b["timeline_score"], f"+{b['pi_bonus']}", b["total_score"],
-                ],
-            })
-            st.dataframe(sanitize_for_streamlit(cmp_df), width="stretch", hide_index=True)
+            cmp_df = build_comparison_table(a, b, pick_a, pick_b)
+            st.dataframe(clean_dataframe_for_streamlit(cmp_df), width="stretch", hide_index=True)
 
             st.markdown("#### Score Breakdown")
             ch1, ch2 = st.columns(2)
