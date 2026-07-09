@@ -148,21 +148,24 @@ def _resolve_gemini_key() -> str:
 
 def get_semantic_analysis(text: str) -> dict:
     """
-    Call the Gemini API as a *Ministry of Coal Technical Auditor* and return
+    Call the Gemini API as a *Ministry of Coal R&D Evaluator* and return
     a structured evaluation of the proposal text.
 
-    Uses ``gemini-1.5-pro`` via the new ``google.genai`` Client SDK
+    Uses ``gemini-2.5-flash`` via the ``google.genai`` Client SDK
     with all safety categories set to ``BLOCK_NONE`` to prevent false flags
     on coal-mining terminology.
 
     Returns
     -------
     dict
-        ``innovation_score``  (int 1–10)
-        ``feasibility_score`` (int 1–10)
-        ``impact_score``      (int 1–10)
-        ``technical_summary`` (str, 2 sentences)
-        ``model``             (str, model name used)
+        ``technical_innovation``          (int 1–10)
+        ``economic_viability``            (int 1–10)
+        ``environmental_sustainability``  (int 1–10)
+        ``ministry_alignment``            (int 1–10)
+        ``reasoning``                     (str, 2 sentences)
+        ``model``                         (str, model name used)
+        Plus metadata: ``Project Name``, ``Sponsoring Agency``,
+        ``Budget``, ``Duration``.
 
     Raises
     ------
@@ -195,59 +198,39 @@ def get_semantic_analysis(text: str) -> dict:
             "Ensure the PDF has readable content."
         )
 
-    RUBRIC_PROMPT = """\
-You are a **Ministry of Coal — Technical Auditor** reviewing an Indian Coal R&D
-Proposal.  Be rigorous, fair, and concise.
+    prompt_text = f"""
+You are an expert Technical Evaluator for the Ministry of Coal R&D Division. Your job is to strictly and critically analyze the following research proposal. Do NOT give generic high scores. You must justify every point.
 
-Evaluate the proposal and return ONLY a raw JSON object (no markdown fences,
-no backticks, no extra text) with this exact schema:
+Evaluate the text against these strict criteria on a scale of 1 to 10 (where 1 is completely unviable and 10 is industry-defining):
+1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
+2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
+3. Environmental Sustainability: Does it actively reduce carbon footprint or environmental impact?
+4. Ministry Alignment: Does it directly serve coal sector safety, efficiency, or sustainability targets?
 
-{
-  "innovation_score": <int 1-10>,
-  "feasibility_score": <int 1-10>,
-  "impact_score": <int 1-10>,
-  "technical_summary": "<exactly 2 sentences summarising strengths and risks>"
-}
+CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object. Do NOT wrap it in markdown. Do NOT add extra conversational text. Use exactly these keys:
+{{{{
+    "Project Name": "Extract exact title or return 'Unknown'",
+    "Sponsoring Agency": "Extract exact agency or return 'Unknown'",
+    "Budget": "Extract budget value or return 'Unknown'",
+    "Duration": "Extract duration or return 'Unknown'",
+    "technical_innovation": <integer 1-10>,
+    "economic_viability": <integer 1-10>,
+    "environmental_sustainability": <integer 1-10>,
+    "ministry_alignment": <integer 1-10>,
+    "reasoning": "Provide a strict, professional 2-sentence justification for the scores given. Point out specific flaws or strengths."
+}}}}
 
-Scoring guidelines:
-- **innovation_score**: Novelty of approach, use of emerging tech (AI/IoT/
-  drones/sensors), advanced materials or methods.  8+ requires strong,
-  explicit evidence of breakthrough innovation.
-- **feasibility_score**: Budget realism, timeline achievability, team
-  capability, infrastructure readiness.  8+ requires clear evidence of
-  prior results or institutional partnerships.
-- **impact_score**: Potential impact on coal sector efficiency, safety,
-  environmental sustainability, carbon reduction, or alignment with
-  Ministry of Coal 2026 strategic priorities (Coal Gasification, Blue
-  Hydrogen, Mine Safety, Carbon Capture, Pit Lake Management).  8+ requires
-  quantified impact projections or strong policy alignment.
-
-Rules:
-- Return ONLY the raw JSON object — no markdown fences, no extra commentary.
-- If evidence is ambiguous, default to 5.
-- Be strict: 8+ requires strong, explicit evidence.
-
-You MUST use these exact property names: "innovation_score", "feasibility_score",
-"impact_score", "technical_summary".  Do not rename or paraphrase them.
-
-When the proposal text contains structured metadata, also extract and return
-these additional fields (leave as empty string if not found):
-  "Project Name": "<title of the project>",
-  "Sponsoring Agency": "<funding body or agency>",
-  "Budget": "<total budget string>",
-  "Duration": "<project duration string>"
-
-CRITICAL: You must return ONLY strictly valid JSON. All property names and string values must be enclosed in double quotes. Do not include trailing commas. Do not wrap the response in markdown blocks.
+Proposal Text:
+{cleaned}
 """
 
     model_name = "gemini-2.5-flash"
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,
-        contents=f"Evaluate the following R&D proposal:\n\n{cleaned}",
+        contents=prompt_text,
         config=genai_types.GenerateContentConfig(
             response_mime_type="application/json",
-            system_instruction=RUBRIC_PROMPT,
             temperature=0.2,
             max_output_tokens=512,
             safety_settings=[
@@ -280,10 +263,15 @@ CRITICAL: You must return ONLY strictly valid JSON. All property names and strin
             return 5
 
     raw_result = {
-        "innovation_score": _clamp(parsed.get("innovation_score")),
-        "feasibility_score": _clamp(parsed.get("feasibility_score")),
-        "impact_score": _clamp(parsed.get("impact_score")),
-        "technical_summary": str(parsed.get("technical_summary", "No summary provided.")),
+        "Project Name": str(parsed.get("Project Name", "Unknown")),
+        "Sponsoring Agency": str(parsed.get("Sponsoring Agency", "Unknown")),
+        "Budget": str(parsed.get("Budget", "Unknown")),
+        "Duration": str(parsed.get("Duration", "Unknown")),
+        "technical_innovation": _clamp(parsed.get("technical_innovation")),
+        "economic_viability": _clamp(parsed.get("economic_viability")),
+        "environmental_sustainability": _clamp(parsed.get("environmental_sustainability")),
+        "ministry_alignment": _clamp(parsed.get("ministry_alignment")),
+        "reasoning": str(parsed.get("reasoning", "No justification provided.")),
         "model": model_name,
     }
     return normalize_ai_score_keys(raw_result)
@@ -1074,6 +1062,8 @@ if nav == "➕ New Entry":
                         icon="❌",
                     )
                 else:
+                    # Force fresh API call — clear stale results
+                    st.session_state.pop("_ai_scores", None)
                     with st.spinner("🧠 Gemini AI is evaluating the proposal…"):
                         try:
                             form_data = smart_extract_for_form(_tmp_path)
@@ -1146,11 +1136,14 @@ if nav == "➕ New Entry":
         )
 
         if run_semantic and _audit_pdf is not None:
+            # Force fresh API call — clear stale results
+            st.session_state.pop("_semantic_result", None)
+            st.session_state.pop("_ai_scores", None)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(_audit_pdf.getbuffer())
                 _sem_path = tmp.name
             try:
-                with st.spinner("🧠 Gemini 1.5 Pro is auditing the proposal…"):
+                with st.spinner("🧠 Gemini AI is auditing the proposal…"):
                     from extraction_engine import extract_text
                     raw_text, _ = extract_text(_sem_path)
                     sem_result = get_semantic_analysis(raw_text)
@@ -1292,6 +1285,8 @@ if nav == "➕ New Entry":
                 icon="⚠️",
             )
         else:
+            # Force fresh API call — clear stale results
+            st.session_state.pop("_deep_analysis", None)
             with st.spinner("Ministry AI is analyzing the proposal…"):
                 try:
                     deep_result = get_semantic_analysis(
@@ -1609,6 +1604,8 @@ if run_eval_semantic:
             icon="⚠️",
         )
     else:
+        # Force fresh API call — clear stale results
+        st.session_state.pop("_deep_analysis_eval", None)
         with st.spinner("Ministry AI is analyzing the proposal…"):
             try:
                 deep_result = get_semantic_analysis(
