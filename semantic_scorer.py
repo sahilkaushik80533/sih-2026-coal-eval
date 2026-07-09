@@ -72,55 +72,33 @@ def _build_safety_settings() -> list:
         ),
     ]
 
-#: The system prompt that turns Gemini into a Ministry of Coal Technical Auditor.
+#: The system prompt that turns Gemini into a strict Ministry of Coal R&D Evaluator.
 SYSTEM_PROMPT = """\
-You are a **Ministry of Coal — Technical Auditor**.  Your job is to evaluate
-an R&D proposal submitted for the Indian Coal sector.  Be rigorous, fair,
-and concise.
+You are an expert Technical Evaluator for the Ministry of Coal R&D Division.
+Your job is to strictly and critically analyze the following research proposal.
+Do NOT give generic high scores. You must justify every point.
 
-Evaluate the proposal on **exactly three** dimensions, each on a 1–10 scale:
+Evaluate the text against these strict criteria on a scale of 1 to 10
+(where 1 is completely unviable and 10 is industry-defining):
+1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
+2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
+3. Environmental Sustainability: Does it actively reduce carbon footprint or environmental impact?
+4. Ministry Alignment: Does it directly serve coal sector safety, efficiency, or sustainability targets?
 
-1. **innovation_score** — Novelty of approach, use of emerging technologies
-   (AI / IoT / drones / sensors), advanced materials, or novel methods.
-   8+ requires strong, explicit evidence of breakthrough innovation.
-2. **feasibility_score** — Budget realism, timeline achievability, team
-   capability, infrastructure readiness, and prior pilot work.
-   8+ requires clear evidence of prior results or institutional partnerships.
-3. **impact_score** — Potential impact on coal sector efficiency, safety,
-   environmental sustainability, carbon reduction, or alignment with
-   Ministry of Coal 2026 strategic priorities (e.g. Coal Gasification,
-   Blue Hydrogen, Mine Safety, Carbon Capture, Pit Lake Management).
-   8+ requires quantified impact projections or strong policy alignment.
-
-Also provide a **technical_summary**: exactly 2 sentences summarising the
-proposal's core strengths and primary risks.
-
-Return your response **only** as a raw JSON object with this exact schema:
-
-{
-  "innovation_score": <int 1-10>,
-  "feasibility_score": <int 1-10>,
-  "impact_score": <int 1-10>,
-  "technical_summary": "<exactly 2 sentences>"
-}
-
-You MUST use these exact property names: "innovation_score", "feasibility_score",
-"impact_score", "technical_summary".  Do not rename or paraphrase them.
-
-When the proposal text contains structured metadata, also extract and return
-these additional fields (leave as empty string if not found):
-  "Project Name": "<title of the project>",
-  "Sponsoring Agency": "<funding body or agency>",
-  "Budget": "<total budget string>",
-  "Duration": "<project duration string>"
-
-Rules:
-- Return ONLY the raw JSON object.  No markdown fences, no backticks, no
-  extra text before or after the JSON.
-- Choose a score of 5 if the evidence is unclear or ambiguous.
-- Be strict: a score of 8+ requires strong, explicit evidence in the text.
-
-CRITICAL: You must return ONLY strictly valid JSON. All property names and string values must be enclosed in double quotes. Do not include trailing commas. Do not wrap the response in markdown blocks.
+CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object.
+Do NOT wrap it in markdown. Do NOT add extra conversational text.
+Use exactly these keys:
+{{
+    "Project Name": "Extract exact title or return 'Unknown'",
+    "Sponsoring Agency": "Extract exact agency or return 'Unknown'",
+    "Budget": "Extract budget value or return 'Unknown'",
+    "Duration": "Extract duration or return 'Unknown'",
+    "technical_innovation": <integer 1-10>,
+    "economic_viability": <integer 1-10>,
+    "environmental_sustainability": <integer 1-10>,
+    "ministry_alignment": <integer 1-10>,
+    "reasoning": "Provide a strict, professional 2-sentence justification for the scores given. Point out specific flaws or strengths."
+}}
 """
 
 
@@ -174,10 +152,15 @@ def parse_ai_response(raw_text: str) -> dict[str, Any]:
         return m.group(1) if m else ""
 
     return {
-        "innovation_score": _re_int("innovation_score"),
-        "feasibility_score": _re_int("feasibility_score"),
-        "impact_score": _re_int("impact_score"),
-        "technical_summary": _re_str("technical_summary") or "No summary provided.",
+        "Project Name": _re_str("Project Name") or "Unknown",
+        "Sponsoring Agency": _re_str("Sponsoring Agency") or "Unknown",
+        "Budget": _re_str("Budget") or "Unknown",
+        "Duration": _re_str("Duration") or "Unknown",
+        "technical_innovation": _re_int("technical_innovation"),
+        "economic_viability": _re_int("economic_viability"),
+        "environmental_sustainability": _re_int("environmental_sustainability"),
+        "ministry_alignment": _re_int("ministry_alignment"),
+        "reasoning": _re_str("reasoning") or "No justification provided.",
     }
 
 
@@ -213,13 +196,16 @@ def analyze_proposal(
     api_key : str
         Google Gemini API key.
     model_name : str, optional
-        Model to use.  Defaults to ``MODEL_NAME`` (``gemini-1.5-pro``).
+        Model to use.  Defaults to ``MODEL_NAME``.
 
     Returns
     -------
     dict
-        Keys: ``innovation_score``, ``feasibility_score``, ``impact_score``
-        (int 1–10), ``technical_summary`` (str), ``model`` (str).
+        Keys: ``technical_innovation``, ``economic_viability``,
+        ``environmental_sustainability``, ``ministry_alignment``
+        (int 1–10), ``reasoning`` (str), ``model`` (str), plus
+        metadata fields ``Project Name``, ``Sponsoring Agency``,
+        ``Budget``, ``Duration``.
 
     Raises
     ------
@@ -252,9 +238,34 @@ def analyze_proposal(
 
     for candidate in models_to_try:
         try:
+            prompt_text = f"""
+You are an expert Technical Evaluator for the Ministry of Coal R&D Division. Your job is to strictly and critically analyze the following research proposal. Do NOT give generic high scores. You must justify every point.
+
+Evaluate the text against these strict criteria on a scale of 1 to 10 (where 1 is completely unviable and 10 is industry-defining):
+1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
+2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
+3. Environmental Sustainability: Does it actively reduce carbon footprint or environmental impact?
+4. Ministry Alignment: Does it directly serve coal sector safety, efficiency, or sustainability targets?
+
+CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object. Do NOT wrap it in markdown. Do NOT add extra conversational text. Use exactly these keys:
+{{{{
+    "Project Name": "Extract exact title or return 'Unknown'",
+    "Sponsoring Agency": "Extract exact agency or return 'Unknown'",
+    "Budget": "Extract budget value or return 'Unknown'",
+    "Duration": "Extract duration or return 'Unknown'",
+    "technical_innovation": <integer 1-10>,
+    "economic_viability": <integer 1-10>,
+    "environmental_sustainability": <integer 1-10>,
+    "ministry_alignment": <integer 1-10>,
+    "reasoning": "Provide a strict, professional 2-sentence justification for the scores given. Point out specific flaws or strengths."
+}}}}
+
+Proposal Text:
+{cleaned}
+"""
             response = client.models.generate_content(
                 model=candidate,
-                contents=f"Evaluate the following R&D proposal:\n\n{cleaned}",
+                contents=prompt_text,
                 config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
                     system_instruction=SYSTEM_PROMPT,
@@ -286,18 +297,18 @@ def analyze_proposal(
     parsed = parse_ai_response(raw_text)
 
     scored = {
-        "innovation_score": _clamp(parsed.get("innovation_score")),
-        "feasibility_score": _clamp(parsed.get("feasibility_score")),
-        "impact_score": _clamp(parsed.get("impact_score")),
-        "technical_summary": str(
-            parsed.get("technical_summary", "No summary provided.")
+        "Project Name": str(parsed.get("Project Name", "Unknown")),
+        "Sponsoring Agency": str(parsed.get("Sponsoring Agency", "Unknown")),
+        "Budget": str(parsed.get("Budget", "Unknown")),
+        "Duration": str(parsed.get("Duration", "Unknown")),
+        "technical_innovation": _clamp(parsed.get("technical_innovation")),
+        "economic_viability": _clamp(parsed.get("economic_viability")),
+        "environmental_sustainability": _clamp(parsed.get("environmental_sustainability")),
+        "ministry_alignment": _clamp(parsed.get("ministry_alignment")),
+        "reasoning": str(
+            parsed.get("reasoning", "No justification provided.")
         ),
         "model": used_model,
     }
-
-    # Copy any extracted metadata fields through
-    for meta_key in ("Project Name", "Sponsoring Agency", "Budget", "Duration"):
-        if meta_key in parsed:
-            scored[meta_key] = parsed[meta_key]
 
     return normalize_ai_score_keys(scored)
