@@ -3,9 +3,11 @@ semantic_scorer.py
 ==================
 AI-driven Semantic Scoring Engine for Coal R&D Proposals.
 
-Uses the **Google Gemini API** (``google-genai``) to evaluate proposal
-text against a strict Ministry of Coal rubric and return structured JSON
-scores that can auto-populate the evaluation form.
+Uses the **Google Gemini API** (``google-genai``) with native PDF vision
+capabilities to evaluate proposal documents against a strict Ministry of
+Coal rubric and return structured JSON scores that can auto-populate the
+evaluation form.  Raw PDF bytes are sent directly to the model — no local
+text extraction is required.
 
 Dependencies
 ------------
@@ -36,11 +38,6 @@ except ImportError:
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
-
-#: Maximum characters of proposal text to send.  Gemini 1.5 Pro supports
-#: up to ~2 M tokens, but we cap at 30 000 chars (~8 000 tokens) to stay
-#: well within free-tier limits and keep latency low.
-MAX_TEXT_CHARS = 30_000
 
 #: Model name — stable endpoint; avoid `-latest` aliases which may 404.
 MODEL_NAME = "gemini-2.5-flash"
@@ -75,10 +72,10 @@ def _build_safety_settings() -> list:
 #: The system prompt that turns Gemini into a strict Ministry of Coal R&D Evaluator.
 SYSTEM_PROMPT = """\
 You are an expert Technical Evaluator for the Ministry of Coal R&D Division.
-Your job is to strictly and critically analyze the following research proposal.
+Your job is to strictly and critically analyze the attached PDF research proposal.
 Do NOT give generic high scores. You must justify every point.
 
-Evaluate the text against these strict criteria on a scale of 1 to 10
+Evaluate the attached PDF document against these strict criteria on a scale of 1 to 10
 (where 1 is completely unviable and 10 is industry-defining):
 1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
 2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
@@ -102,12 +99,7 @@ Use exactly these keys:
 """
 
 
-def _clean_and_truncate(text: str) -> str:
-    """Collapse whitespace and truncate to ``MAX_TEXT_CHARS``."""
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > MAX_TEXT_CHARS:
-        text = text[:MAX_TEXT_CHARS] + "\n\n[…text truncated for evaluation…]"
-    return text
+# _clean_and_truncate removed — no longer needed with native PDF vision.
 
 
 def parse_ai_response(raw_text: str) -> dict[str, Any]:
@@ -181,18 +173,19 @@ def is_available() -> bool:
 
 
 def analyze_proposal(
-    text: str,
+    pdf_bytes: bytes,
     api_key: str,
     *,
     model_name: str | None = None,
 ) -> dict[str, Any]:
     """
-    Send *text* to Gemini and return structured scores.
+    Send raw *pdf_bytes* to Gemini via native PDF vision and return
+    structured scores.
 
     Parameters
     ----------
-    text : str
-        Full proposal text (will be cleaned and truncated).
+    pdf_bytes : bytes
+        Raw bytes of the PDF document.
     api_key : str
         Google Gemini API key.
     model_name : str, optional
@@ -218,16 +211,36 @@ def analyze_proposal(
             "Run: pip install google-genai"
         )
 
+    if not pdf_bytes:
+        raise ValueError("No PDF data provided. Ensure the PDF file is not empty.")
+
     _model = model_name or MODEL_NAME
 
     client = genai.Client(api_key=api_key)
 
-    cleaned = _clean_and_truncate(text)
-    if len(cleaned) < 100:
-        raise ValueError(
-            "The extracted text is too short to evaluate. "
-            "Ensure the PDF has readable content."
-        )
+    prompt_text = """
+Analyze the attached PDF document against these strict criteria.
+You are an expert Technical Evaluator for the Ministry of Coal R&D Division. Your job is to strictly and critically analyze the attached PDF research proposal. Do NOT give generic high scores. You must justify every point.
+
+Evaluate the attached PDF document against these strict criteria on a scale of 1 to 10 (where 1 is completely unviable and 10 is industry-defining):
+1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
+2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
+3. Environmental Sustainability: Does it actively reduce carbon footprint or environmental impact?
+4. Ministry Alignment: Does it directly serve coal sector safety, efficiency, or sustainability targets?
+
+CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object. Do NOT wrap it in markdown. Do NOT add extra conversational text. Use exactly these keys:
+{{
+    "Project Name": "Extract exact title or return 'Unknown'",
+    "Sponsoring Agency": "Extract exact agency or return 'Unknown'",
+    "Budget": "Extract budget value or return 'Unknown'",
+    "Duration": "Extract duration or return 'Unknown'",
+    "technical_innovation": <integer 1-10>,
+    "economic_viability": <integer 1-10>,
+    "environmental_sustainability": <integer 1-10>,
+    "ministry_alignment": <integer 1-10>,
+    "reasoning": "Provide a strict, professional 2-sentence justification for the scores given. Point out specific flaws or strengths."
+}}
+"""
 
     # Build the ordered list of models to attempt
     models_to_try = [_model] + [m for m in FALLBACK_MODELS if m != _model]
@@ -238,34 +251,15 @@ def analyze_proposal(
 
     for candidate in models_to_try:
         try:
-            prompt_text = f"""
-You are an expert Technical Evaluator for the Ministry of Coal R&D Division. Your job is to strictly and critically analyze the following research proposal. Do NOT give generic high scores. You must justify every point.
-
-Evaluate the text against these strict criteria on a scale of 1 to 10 (where 1 is completely unviable and 10 is industry-defining):
-1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
-2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
-3. Environmental Sustainability: Does it actively reduce carbon footprint or environmental impact?
-4. Ministry Alignment: Does it directly serve coal sector safety, efficiency, or sustainability targets?
-
-CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object. Do NOT wrap it in markdown. Do NOT add extra conversational text. Use exactly these keys:
-{{{{
-    "Project Name": "Extract exact title or return 'Unknown'",
-    "Sponsoring Agency": "Extract exact agency or return 'Unknown'",
-    "Budget": "Extract budget value or return 'Unknown'",
-    "Duration": "Extract duration or return 'Unknown'",
-    "technical_innovation": <integer 1-10>,
-    "economic_viability": <integer 1-10>,
-    "environmental_sustainability": <integer 1-10>,
-    "ministry_alignment": <integer 1-10>,
-    "reasoning": "Provide a strict, professional 2-sentence justification for the scores given. Point out specific flaws or strengths."
-}}}}
-
-Proposal Text:
-{cleaned}
-"""
             response = client.models.generate_content(
                 model=candidate,
-                contents=prompt_text,
+                contents=[
+                    genai_types.Part.from_bytes(
+                        data=pdf_bytes,
+                        mime_type="application/pdf",
+                    ),
+                    prompt_text,
+                ],
                 config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
                     system_instruction=SYSTEM_PROMPT,

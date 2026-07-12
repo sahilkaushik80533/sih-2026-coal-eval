@@ -146,14 +146,20 @@ def _resolve_gemini_key() -> str:
 # Now constructed as google.genai types.SafetySetting objects at call time.
 
 
-def get_semantic_analysis(text: str) -> dict:
+def get_semantic_analysis(pdf_bytes: bytes) -> dict:
     """
     Call the Gemini API as a *Ministry of Coal R&D Evaluator* and return
-    a structured evaluation of the proposal text.
+    a structured evaluation by passing the raw PDF bytes directly to
+    Gemini's native PDF vision.
 
     Uses ``gemini-2.5-flash`` via the ``google.genai`` Client SDK
     with all safety categories set to ``BLOCK_NONE`` to prevent false flags
     on coal-mining terminology.
+
+    Parameters
+    ----------
+    pdf_bytes : bytes
+        Raw bytes of the PDF document.
 
     Returns
     -------
@@ -172,7 +178,7 @@ def get_semantic_analysis(text: str) -> dict:
     RuntimeError
         If the Gemini SDK is missing or the API key is absent.
     """
-    import json, re  # local — already at module top but keep scope clear
+    import json  # local — already at module top but keep scope clear
 
     if not _GENAI_AVAILABLE:
         raise RuntimeError(
@@ -190,25 +196,21 @@ def get_semantic_analysis(text: str) -> dict:
             '  [gemini]\n  api_key = "your-key"'
         )
 
-    # Truncate to ~30 000 chars to stay within free-tier limits
-    cleaned = re.sub(r"\s+", " ", text).strip()[:30_000]
-    if len(cleaned) < 100:
-        raise ValueError(
-            "Extracted text is too short for meaningful analysis. "
-            "Ensure the PDF has readable content."
-        )
+    if not pdf_bytes:
+        raise ValueError("No PDF data provided. Ensure the PDF file is not empty.")
 
-    prompt_text = f"""
-You are an expert Technical Evaluator for the Ministry of Coal R&D Division. Your job is to strictly and critically analyze the following research proposal. Do NOT give generic high scores. You must justify every point.
+    prompt_text = """
+Analyze the attached PDF document against these strict criteria.
+You are an expert Technical Evaluator for the Ministry of Coal R&D Division. Your job is to strictly and critically analyze the attached PDF research proposal. Do NOT give generic high scores. You must justify every point.
 
-Evaluate the text against these strict criteria on a scale of 1 to 10 (where 1 is completely unviable and 10 is industry-defining):
+Evaluate the attached PDF document against these strict criteria on a scale of 1 to 10 (where 1 is completely unviable and 10 is industry-defining):
 1. Technical Innovation: Does it introduce novel methodology, or just repeat standard practices?
 2. Economic Viability: Is the budget realistic and justified by the proposed outcomes?
 3. Environmental Sustainability: Does it actively reduce carbon footprint or environmental impact?
 4. Ministry Alignment: Does it directly serve coal sector safety, efficiency, or sustainability targets?
 
 CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object. Do NOT wrap it in markdown. Do NOT add extra conversational text. Use exactly these keys:
-{{{{
+{{
     "Project Name": "Extract exact title or return 'Unknown'",
     "Sponsoring Agency": "Extract exact agency or return 'Unknown'",
     "Budget": "Extract budget value or return 'Unknown'",
@@ -218,17 +220,20 @@ CRITICAL INSTRUCTION: You must return ONLY a strictly valid JSON object. Do NOT 
     "environmental_sustainability": <integer 1-10>,
     "ministry_alignment": <integer 1-10>,
     "reasoning": "Provide a strict, professional 2-sentence justification for the scores given. Point out specific flaws or strengths."
-}}}}
-
-Proposal Text:
-{cleaned}
+}}
 """
 
     model_name = "gemini-2.5-flash"
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,
-        contents=prompt_text,
+        contents=[
+            genai_types.Part.from_bytes(
+                data=pdf_bytes,
+                mime_type="application/pdf",
+            ),
+            prompt_text,
+        ],
         config=genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0.2,
@@ -1010,17 +1015,8 @@ if nav == "➕ New Entry":
                 st.session_state["_smart_fill"] = result
                 st.session_state["_smart_pdf_name"] = scan_pdf.name
 
-                # Store extracted text for downstream semantic analysis
-                from extraction_engine import extract_text as _ext_text
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as _txt_tmp:
-                    _txt_tmp.write(scan_pdf.getbuffer())
-                    _txt_tmp_path = _txt_tmp.name
-                try:
-                    _raw, _ = _ext_text(_txt_tmp_path)
-                    st.session_state["extracted_text"] = _raw
-                finally:
-                    if os.path.exists(_txt_tmp_path):
-                        os.unlink(_txt_tmp_path)
+                # Store raw PDF bytes for downstream semantic analysis
+                st.session_state["pdf_bytes"] = scan_pdf.getvalue()
 
                 flags = result["confidence_flags"]
                 conf = result["confidence_score"]
@@ -1070,14 +1066,12 @@ if nav == "➕ New Entry":
                             st.session_state["_smart_fill"] = form_data
                             st.session_state["_smart_pdf_name"] = scan_pdf.name
 
-                            from extraction_engine import extract_text
-                            raw_text, _ = extract_text(_tmp_path)
-
+                            pdf_bytes = scan_pdf.getvalue()
                             ai_result = semantic_scorer.analyze_proposal(
-                                raw_text, gemini_key,
+                                pdf_bytes, gemini_key,
                             )
                             st.session_state["_ai_scores"] = ai_result
-                            st.session_state["extracted_text"] = raw_text
+                            st.session_state["pdf_bytes"] = pdf_bytes
                         except Exception as exc:
                             st.error(f"AI analysis failed: {exc}", icon="❌")
                             ai_result = None
@@ -1139,15 +1133,12 @@ if nav == "➕ New Entry":
             # Force fresh API call — clear stale results
             st.session_state.pop("_semantic_result", None)
             st.session_state.pop("_ai_scores", None)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(_audit_pdf.getbuffer())
-                _sem_path = tmp.name
+            _pdf_bytes = _audit_pdf.getvalue()
             try:
                 with st.spinner("🧠 Gemini AI is auditing the proposal…"):
-                    from extraction_engine import extract_text
-                    raw_text, _ = extract_text(_sem_path)
-                    sem_result = get_semantic_analysis(raw_text)
+                    sem_result = get_semantic_analysis(_pdf_bytes)
                     st.session_state["_semantic_result"] = sem_result
+                    st.session_state["pdf_bytes"] = _pdf_bytes
             except (RuntimeError, ValueError) as exc:
                 # Config / validation errors (missing API key, short text, etc.)
                 st.error(
@@ -1183,9 +1174,7 @@ if nav == "➕ New Entry":
                         f"**AI Semantic Audit failed:** {err_msg}",
                         icon="❌",
                     )
-            finally:
-                if os.path.exists(_sem_path):
-                    os.unlink(_sem_path)
+
 
         # ── Display results & auto-fill ──────────────────────────────────
         sem = st.session_state.get("_semantic_result")
@@ -1278,7 +1267,7 @@ if nav == "➕ New Entry":
     )
 
     if run_deep_analysis:
-        if not st.session_state.get("extracted_text"):
+        if not st.session_state.get("pdf_bytes"):
             st.warning(
                 "⬆️ Please upload and extract a PDF first using the "
                 "**Smart Extract & AI Scoring** panel above.",
@@ -1290,7 +1279,7 @@ if nav == "➕ New Entry":
             with st.spinner("Ministry AI is analyzing the proposal…"):
                 try:
                     deep_result = get_semantic_analysis(
-                        st.session_state["extracted_text"]
+                        st.session_state["pdf_bytes"]
                     )
                     st.session_state["_deep_analysis"] = deep_result
                     st.success(
@@ -1535,17 +1524,8 @@ if new_files:
                 st.write("Extracting digital text (PyMuPDF)…")
                 metadata = extract_from_upload(uf)
 
-                # Also store the raw text for semantic analysis
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as _ev_tmp:
-                    _ev_tmp.write(uf.getbuffer())
-                    _ev_tmp_path = _ev_tmp.name
-                try:
-                    from extraction_engine import extract_text as _ev_ext
-                    _ev_raw, _ = _ev_ext(_ev_tmp_path)
-                    st.session_state["extracted_text"] = _ev_raw
-                finally:
-                    if os.path.exists(_ev_tmp_path):
-                        os.unlink(_ev_tmp_path)
+                # Store raw PDF bytes for semantic analysis
+                st.session_state["pdf_bytes"] = uf.getvalue()
 
                 st.write(f"Extraction method: **{metadata.get('extraction_method', 'Digital Text Layer')}**")
                 st.write("Calculating score…")
@@ -1597,10 +1577,10 @@ run_eval_semantic = st.button(
 )
 
 if run_eval_semantic:
-    if not st.session_state.get("extracted_text"):
+    if not st.session_state.get("pdf_bytes"):
         st.warning(
             "👈 Upload a PDF proposal from the sidebar first. "
-            "The text will be extracted automatically.",
+            "The PDF bytes will be stored automatically.",
             icon="⚠️",
         )
     else:
@@ -1609,7 +1589,7 @@ if run_eval_semantic:
         with st.spinner("Ministry AI is analyzing the proposal…"):
             try:
                 deep_result = get_semantic_analysis(
-                    st.session_state["extracted_text"]
+                    st.session_state["pdf_bytes"]
                 )
                 st.session_state["_deep_analysis_eval"] = deep_result
                 st.success(
