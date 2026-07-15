@@ -6,26 +6,15 @@ Streamlit front-end for the Ministry of Coal R&D Proposal Evaluation System.
 Integrates:
   - extraction_engine.py  → PDF → structured metadata
   - proposal_ranker.py    → metadata → weighted scores
-  - Google Sheets         → persist results to Ministry database
+  - MongoDB Atlas         → persist results to Ministry database
 
 Run:
     streamlit run app.py
 
-Google Sheets Setup
--------------------
-To enable data persistence, create a ``.streamlit/secrets.toml`` file with
-your GCP service-account credentials and spreadsheet URL.  See the template
-shipped alongside this project for details.  The app runs in **offline mode**
-when credentials are not configured.
-
-Data Caching Strategy
----------------------
-- ``fetch_sheet_data()`` is decorated with ``@st.cache_data(ttl=30)`` so
-  reads from Google Sheets are cached for 30 seconds, avoiding redundant
-  API calls on every Streamlit rerun.
-- When new data is submitted (via the Entry form or the Submit button),
-  ``st.cache_data.clear()`` is called explicitly to force a fresh read on
-  the next render, keeping the View tab in real-time sync.
+MongoDB Setup
+-------------
+To enable data persistence, add ``MONGO_URI`` to ``.streamlit/secrets.toml``.
+The app stores evaluations in the ``coal_rnd_db.evaluations`` collection.
 """
 
 from __future__ import annotations
@@ -63,6 +52,8 @@ from data_processing import (
     apply_leaderboard_gradient,
     normalize_json_keys,
     normalize_ai_score_keys,
+    save_evaluation,
+    get_all_evaluations,
 )
 
 # ── Google Drive API (for PDF uploads — no temp files) ───────────────────────
@@ -74,14 +65,6 @@ try:
     _DRIVE_LIB_AVAILABLE = True
 except ImportError:
     _DRIVE_LIB_AVAILABLE = False
-
-# ── Google Sheets (soft import — works without credentials) ──────────────────
-try:
-    from streamlit_gsheets import GSheetsConnection
-
-    _GSHEETS_LIB_AVAILABLE = True
-except ImportError:
-    _GSHEETS_LIB_AVAILABLE = False
 
 # ── Constants ────────────────────────────────────────────────────────────────
 SERVICE_ACCOUNT_EMAIL = "sih-robot@sih-coal-eval.iam.gserviceaccount.com"
@@ -368,201 +351,22 @@ st.markdown(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GOOGLE SHEETS — CONNECTION & DATA OPS
+#  MONGODB — CONNECTIVITY CHECK
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _validate_secrets() -> str | None:
+def _check_mongo_connection() -> tuple[bool, str | None]:
     """
-    Pre-flight check: make sure the critical secrets fields are filled in.
+    Ping MongoDB Atlas to confirm the connection is alive.
 
-    Returns None if everything looks good, or an error message string.
+    Returns (is_online, error_message).
     """
     try:
-        gs = st.secrets["connections"]["gsheets"]
-    except (KeyError, FileNotFoundError):
-        return (
-            "**Secrets not configured.** Create `.streamlit/secrets.toml` "
-            "with your Google Sheets credentials.\n\n"
-            "See the template shipped with this project for the exact format."
-        )
-
-    spreadsheet_url = gs.get("spreadsheet", "")
-    private_key = gs.get("private_key", "")
-    client_email = gs.get("client_email", "")
-
-    missing = []
-    if not spreadsheet_url:
-        missing.append("`spreadsheet` (full Google Sheet URL)")
-    if not private_key:
-        missing.append("`private_key` (from your JSON key file)")
-    if not client_email:
-        missing.append("`client_email` (service account email)")
-
-    if missing:
-        items = "\n".join(f"  - {m}" for m in missing)
-        return (
-            f"**Incomplete credentials.** The following fields in "
-            f"`.streamlit/secrets.toml` are empty:\n\n{items}\n\n"
-            "Fill them in from your GCP service-account JSON key file."
-        )
-    return None
-
-
-def _get_gsheets_connection():
-    """
-    Establish and validate a Google Sheets connection.
-
-    Returns
-    -------
-    (conn, error_msg) : tuple
-        conn is a GSheetsConnection or None; error_msg explains the failure.
-
-    The function runs three checks:
-      1. Library installed?
-      2. Secrets filled in?  (catches the "File not found" for empty URLs)
-      3. Validation ping — actually reads the sheet to catch 403 / 404 early.
-    """
-    if not _GSHEETS_LIB_AVAILABLE:
-        return None, (
-            "`st-gsheets-connection` is not installed.\n\n"
-            "Run: `pip install st-gsheets-connection`"
-        )
-
-    # ── Step 1: Validate secrets before even trying to connect ────────
-    secrets_err = _validate_secrets()
-    if secrets_err:
-        return None, secrets_err
-
-    # ── Step 2: Create the connection object ──────────────────────────
-    try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
+        from data_processing import client as _mongo_client
+        _mongo_client.admin.command("ping")
+        return True, None
     except Exception as exc:
-        return None, f"Connection init failed: {exc}"
-
-    # ── Step 3: Validation ping — try reading 0 rows ─────────────────
-    #   This surfaces 403/404/FileNotFound immediately instead of letting
-    #   them appear later in fetch_sheet_data() or append_row().
-    try:
-        conn.read(worksheet="Sheet1", usecols=[0], ttl=5)
-    except FileNotFoundError:
-        return None, (
-            "**Spreadsheet not found.** The URL in `secrets.toml` is "
-            "incorrect or the sheet has been deleted.\n\n"
-            "Open `.streamlit/secrets.toml` and set `spreadsheet` to the "
-            "full URL of your Google Sheet\n"
-            "(e.g. `https://docs.google.com/spreadsheets/d/…/edit`)."
-        )
-    except PermissionError:
-        return None, (
-            "**Permission denied.** The service account does not have "
-            "editor access to the Google Sheet.\n\n"
-            "**Fix:** Open your Google Sheet → **Share** → add\n"
-            f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**."
-        )
-    except Exception as exc:
-        err_str = str(exc).lower()
-        if "permission" in err_str or "403" in err_str:
-            return None, (
-                f"**Permission denied (403).** The service account "
-                f"`{SERVICE_ACCOUNT_EMAIL}` does not have access.\n\n"
-                "**Fix:** Open your Google Sheet → **Share** → add\n"
-                f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**."
-            )
-        if "not found" in err_str or "404" in err_str:
-            return None, (
-                "**Sheet not found (404).** Verify the `spreadsheet` URL in "
-                "`.streamlit/secrets.toml`."
-            )
-        if "file not found" in err_str or "no such file" in err_str:
-            return None, (
-                "**Spreadsheet not found.** The URL in `secrets.toml` "
-                "appears to be invalid.\n\n"
-                "Set `spreadsheet` to the full URL of your Google Sheet."
-            )
-        return None, f"Connection validation failed: {exc}"
-
-    return conn, None
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_sheet_data(_conn, worksheet: str = "Sheet1") -> pd.DataFrame | None:
-    """
-    Read all rows from *worksheet*.  Cached for 30 s to reduce API calls.
-
-    Pass the connection object as ``_conn`` (underscore prefix tells
-    Streamlit not to hash it).
-    """
-    try:
-        data = _conn.read(worksheet=worksheet)
-        if data is not None and not data.empty:
-            data = data.dropna(how="all")
-            data = coerce_sheet_columns(data)
-        return data
-    except FileNotFoundError:
-        st.error(
-            "**Spreadsheet not found.** The URL in `secrets.toml` may be "
-            "incorrect.\n\nVerify `spreadsheet` in `.streamlit/secrets.toml`.",
-            icon="🔴",
-        )
-        return None
-    except Exception as exc:
-        err = str(exc).lower()
-        if "permission" in err or "403" in err:
-            st.error(
-                f"**Permission denied.** Share the Google Sheet with "
-                f"`{SERVICE_ACCOUNT_EMAIL}` as **Editor**.",
-                icon="🔴",
-            )
-        else:
-            st.error(f"Failed to read sheet: {exc}", icon="❌")
-        return None
-
-
-def append_row(conn, worksheet: str, columns: list[str],
-               row_dict: dict[str, Any]) -> tuple[bool, str]:
-    """
-    Append *row_dict* as a new row to *worksheet*.
-
-    Returns (success, message).
-    """
-    try:
-        existing = conn.read(worksheet=worksheet)
-        if existing is None or existing.empty:
-            existing = pd.DataFrame(columns=columns)
-        else:
-            existing = existing.dropna(how="all")
-
-        new_row = pd.DataFrame([row_dict])
-        updated = pd.concat([existing, new_row], ignore_index=True)
-        conn.update(worksheet=worksheet, data=updated)
-
-        # Bust the cache so the View tab refreshes immediately
-        st.cache_data.clear()
-        return True, "Row appended successfully."
-    except FileNotFoundError:
-        return False, (
-            "**Spreadsheet not found.** Verify the `spreadsheet` URL in "
-            "`.streamlit/secrets.toml`."
-        )
-    except PermissionError:
-        return False, (
-            f"**Permission denied.** Share the sheet with "
-            f"`{SERVICE_ACCOUNT_EMAIL}` as Editor."
-        )
-    except Exception as exc:
-        err = str(exc).lower()
-        if "permission" in err or "403" in err:
-            return False, (
-                f"**Permission denied (403).** Share the sheet with "
-                f"`{SERVICE_ACCOUNT_EMAIL}` as Editor."
-            )
-        if "not found" in err or "404" in err:
-            return False, (
-                "**Sheet not found.** Verify the `spreadsheet` URL in "
-                "`.streamlit/secrets.toml`."
-            )
-        return False, f"Write failed: {exc}"
+        return False, f"MongoDB connection failed: {exc}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -661,20 +465,6 @@ def upload_pdf_to_drive(
                 "in `.streamlit/secrets.toml`."
             )
         return None, f"Drive upload failed: {exc}"
-
-
-# Legacy wrapper used by the Dashboard tab's "Submit to Ministry" button.
-def submit_to_sheets(conn, scored: dict[str, Any]) -> bool:
-    ok, _ = append_row(conn, "Sheet1", PROPOSAL_COLUMNS, {
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Title": scored["title"],
-        "PI": scored["pi"],
-        "Budget": scored["budget_raw"],
-        "Timeline": scored["timeline_raw"],
-        "Total Score": scored["total_score"],
-        "Justification": scored.get("justification", ""),
-    })
-    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -806,8 +596,7 @@ def render_proposal_card(scored: dict[str, Any]) -> None:
 #  SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-gsheets_conn, gsheets_error = _get_gsheets_connection()
-_gsheets_online = gsheets_conn is not None and gsheets_error is None
+_mongo_online, _mongo_error = _check_mongo_connection()
 
 with st.sidebar:
     st.markdown("## ⚒️ Ministry of Coal")
@@ -825,15 +614,10 @@ with st.sidebar:
 
     # ── System Status ─────────────────────────────────────────────────────
     st.markdown("### ⚙️ System Status")
-    if _gsheets_online:
-        st.success("Database: **Connected**", icon="🟢")
+    if _mongo_online:
+        st.success("Database: **Connected** (MongoDB)", icon="🟢")
 
-        # Professional link buttons (no raw URLs or metadata exposed)
-        sheet_url = st.secrets.get("connections", {}).get("gsheets", {}).get("spreadsheet", "")
         drive_folder_id = st.secrets.get("drive", {}).get("folder_id", "")
-
-        if sheet_url:
-            st.link_button("📊 Open Evaluation Sheet", sheet_url, use_container_width=True)
         if drive_folder_id:
             drive_url = f"https://drive.google.com/drive/folders/{drive_folder_id}"
             st.link_button("📁 Open Document Vault", drive_url, use_container_width=True)
@@ -867,19 +651,19 @@ st.markdown(
 if nav == "📋 View Records":
     st.markdown("### 📋 Coal Evaluation Leaderboard")
 
-    if not _gsheets_online:
+    if not _mongo_online:
         st.error(
-            "**Google Sheets is offline.** Cannot load records.\n\n"
-            + (gsheets_error or "Configure `.streamlit/secrets.toml`."),
+            "**MongoDB is offline.** Cannot load records.\n\n"
+            + (_mongo_error or "Configure `MONGO_URI` in `.streamlit/secrets.toml`."),
             icon="🔴",
         )
         st.stop()
 
-    with st.spinner("Fetching records from Google Sheets…"):
-        sheet_df = fetch_sheet_data(gsheets_conn)
+    with st.spinner("Fetching records from MongoDB…"):
+        sheet_df = get_all_evaluations()
 
     if sheet_df is None or sheet_df.empty:
-        st.info("The Google Sheet is empty — no records to display yet.", icon="📭")
+        st.info("The database is empty — no records to display yet.", icon="📭")
     else:
         # Coerce, sort, and prepare for display
         sheet_df = coerce_sheet_columns(sheet_df)
@@ -968,10 +752,10 @@ if nav == "📋 View Records":
 if nav == "➕ New Entry":
     st.markdown("### ➕ New Coal Evaluation Entry")
 
-    if not _gsheets_online:
+    if not _mongo_online:
         st.error(
-            "**Google Sheets is offline.** Cannot submit entries.\n\n"
-            + (gsheets_error or "Configure `.streamlit/secrets.toml`."),
+            "**MongoDB is offline.** Cannot submit entries.\n\n"
+            + (_mongo_error or "Configure `MONGO_URI` in `.streamlit/secrets.toml`."),
             icon="🔴",
         )
         st.stop()
@@ -1322,8 +1106,8 @@ if nav == "➕ New Entry":
 
     st.markdown("---")
     st.caption(
-        "Fill in the coal sample evaluation form below. Data is appended "
-        "to the connected Google Sheet. If a PDF is attached, it is "
+        "Fill in the coal sample evaluation form below. Data is saved "
+        "to the connected MongoDB database. If a PDF is attached, it is "
         "uploaded to Google Drive and the link is saved with the record."
     )
 
@@ -1472,13 +1256,18 @@ if nav == "➕ New Entry":
             "Total Score": total_score,
             "PDF Link": pdf_link,
         }
-        with st.spinner("Submitting to Google Sheets…"):
-            ok, msg = append_row(gsheets_conn, "Sheet1", EVAL_COLUMNS, row)
+        with st.spinner("Saving to MongoDB…"):
+            try:
+                save_evaluation(row, pdf_filename=proposal_name or "—")
+                ok = True
+            except Exception as exc:
+                ok = False
+                msg = f"MongoDB write failed: {exc}"
         if ok:
             # Clear smart-fill state after successful submit
             st.session_state.pop("_smart_fill", None)
             st.session_state.pop("_smart_pdf_name", None)
-            st.success("✅ Entry submitted and cached data refreshed!", icon="✅")
+            st.success("✅ Entry submitted to MongoDB!", icon="✅")
             st.balloons()
         else:
             st.error(msg, icon="❌")
@@ -1691,9 +1480,9 @@ with tab_dash:
         mime="text/csv",
     )
 
-    # ── Submit to Google Sheets ──────────────────────────────────────────
+    # ── Submit to MongoDB ─────────────────────────────────────────────────
     st.markdown("---")
-    if _gsheets_online:
+    if _mongo_online:
         st.markdown("### 🗄️ Submit to Ministry Database")
         submit_choice = st.selectbox(
             "Select proposal to submit",
@@ -1701,23 +1490,31 @@ with tab_dash:
             key="submit_select",
         )
         if st.button("📤 Submit to Ministry Database", type="primary"):
-            with st.spinner("Writing to Google Sheets…"):
-                success = submit_to_sheets(gsheets_conn, title_map[submit_choice])
+            with st.spinner("Saving to MongoDB…"):
+                try:
+                    scored_item = title_map[submit_choice]
+                    save_evaluation({
+                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Title": scored_item["title"],
+                        "PI": scored_item["pi"],
+                        "Budget": scored_item["budget_raw"],
+                        "Timeline": scored_item["timeline_raw"],
+                        "Total Score": scored_item["total_score"],
+                        "Justification": scored_item.get("justification", ""),
+                    }, pdf_filename=scored_item.get("source_file", ""))
+                    success = True
+                except Exception as exc:
+                    success = False
+                    st.error(f"MongoDB write failed: {exc}", icon="❌")
             if success:
                 st.success(
                     f"**{submit_choice}** submitted to the Ministry database!",
                     icon="✅",
                 )
-            else:
-                st.error(
-                    "Failed to write to Google Sheets.\n\n"
-                    f"Ensure `{SERVICE_ACCOUNT_EMAIL}` has **Editor** access.",
-                    icon="❌",
-                )
     else:
         st.info(
-            "**Database persistence is offline.** Configure Google Sheets "
-            "credentials in `.streamlit/secrets.toml` to enable the "
+            "**Database persistence is offline.** Configure `MONGO_URI` "
+            "in `.streamlit/secrets.toml` to enable the "
             "'Submit to Ministry Database' feature.",
             icon="🗄️",
         )

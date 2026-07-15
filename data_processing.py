@@ -13,6 +13,49 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
+import pymongo
+import streamlit as st
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MONGODB ATLAS — CONNECTION & DATA OPS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@st.cache_resource
+def init_connection():
+    """Return a cached MongoClient using the URI stored in Streamlit secrets."""
+    return pymongo.MongoClient(st.secrets["MONGO_URI"])
+
+
+client = init_connection()
+db = client["coal_rnd_db"]
+collection = db["evaluations"]
+
+
+def save_evaluation(eval_dict: dict[str, Any], pdf_filename: str = "") -> None:
+    """
+    Persist *eval_dict* (typically the parsed Gemini JSON) to MongoDB.
+
+    Adds *pdf_filename* under the ``"PDF Filename"`` key before inserting.
+    """
+    doc = dict(eval_dict)  # shallow copy — don't mutate the caller's dict
+    if pdf_filename:
+        doc["PDF Filename"] = pdf_filename
+    collection.insert_one(doc)
+
+
+def get_all_evaluations() -> pd.DataFrame:
+    """
+    Read every document from the ``evaluations`` collection, drop the
+    MongoDB ``_id`` column, and sanitize the DataFrame for Streamlit display.
+    """
+    records = list(collection.find())
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df.drop(columns=["_id"], inplace=True, errors="ignore")
+    return clean_dataframe_for_streamlit(df)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
